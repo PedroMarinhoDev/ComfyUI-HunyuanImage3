@@ -1,0 +1,6 @@
+# This package needs nothing that ComfyUI does not already install: it imports `comfy.*` and the
+# torch stack the application provides, and reads the tokenizer through `tokenizers`, which is a
+# top-level ComfyUI requirement.
+#
+# The `tools/` scripts that build the checkpoints need the same environment; run them with ComfyUI's
+# own interpreter (`.venv/bin/python`).

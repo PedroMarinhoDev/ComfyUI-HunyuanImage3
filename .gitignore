@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# dev/: scripts and notes are tracked; run output, captures, images, eval data and the vendor's
+# reference code (Tencent license) stay local
+dev/*
+!dev/*.py
+!dev/*.sh
+!dev/*.md
+!dev/README.md

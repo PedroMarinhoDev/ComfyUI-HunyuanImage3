@@ -294,7 +294,7 @@ GEN_IMAGE_CAPTURE_PATH = os.environ.get(
                  "gen_image_cond_sequences.pt"))
 needs_gen_image_capture = pytest.mark.skipif(
     not os.path.exists(GEN_IMAGE_CAPTURE_PATH),
-    reason="set HUNYUAN_IMAGE_3_GEN_IMAGE_CAPTURE to dev/capture_gen_image_cond.py's capture")
+    reason="set HUNYUAN_IMAGE_3_GEN_IMAGE_CAPTURE to the reference capture (dev/gen_image_cond_sequences.pt)")
 
 
 @needs_tokenizer
@@ -302,9 +302,9 @@ needs_gen_image_capture = pytest.mark.skipif(
 def test_padded_image_stage_sequences_match_the_reference(tokenizer):
     """1-3 non-square conditioning images, image stage, id for id against the reference.
 
-    The capture (`dev/capture_gen_image_cond.py` in the HY-WU repo, same pattern as
-    `dev/step12_multi_image_sequence.py`) holds the reference's own `preprocess_inputs`
-    ids for the image stage; the padded builder must reproduce them exactly.
+    The capture (`dev/gen_image_cond_sequences.pt`, taken the way `dev/step12_multi_image_sequence.py`
+    takes its own) holds the reference's own `preprocess_inputs` ids for the image stage; the padded
+    builder must reproduce them exactly.
     """
     from comfy.ldm.hunyuan_image_3.tokenizer import build_sequence
     capture = torch.load(GEN_IMAGE_CAPTURE_PATH, weights_only=False, map_location="cpu")

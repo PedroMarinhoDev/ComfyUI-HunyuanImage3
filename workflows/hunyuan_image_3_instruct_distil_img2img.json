@@ -1,5 +1,5 @@
 {
- "id": "466b0d85-66ac-4170-9bd7-f1d4f67ec7d1",
+ "id": "c15f9eca-903e-43f9-8e75-68ee1ede4043",
  "revision": 0,
  "last_node_id": 18,
  "last_link_id": 21,
@@ -613,7 +613,7 @@
    ],
    "size": [
     420,
-    304
+    328
    ],
    "flags": {},
    "order": 9,
@@ -708,6 +708,15 @@
       "name": "latent_strength"
      },
      "link": null
+    },
+    {
+     "localized_name": "reference_vit_padding",
+     "name": "reference_vit_padding",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "reference_vit_padding"
+     },
+     "link": null
     }
    ],
    "outputs": [
@@ -744,14 +753,16 @@
     1024,
     1024,
     1,
-    1
+    1,
+    true
    ],
    "widgets_values_named": {
     "prompt": "Turn the photograph into a watercolour painting",
     "width": 1024,
     "height": 1024,
     "vit_strength": 1,
-    "latent_strength": 1
+    "latent_strength": 1,
+    "reference_vit_padding": true
    }
   },
   {
@@ -932,7 +943,7 @@
    "type": "PreviewAny",
    "pos": [
     1570,
-    992
+    1016
    ],
    "size": [
     420,

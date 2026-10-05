@@ -29,7 +29,7 @@ time under each image is the whole generation; each row's first image also inclu
 | GPU | an NVIDIA card with 12 GB or more (tested: RTX 4090, RTX 3090, and 16 GB / 12 GB limits, see [smaller GPUs](#smaller-gpus)) |
 | System RAM | a lot. The model streams its weights from RAM every step. With the W4A8 file loaded, ComfyUI held about 50 GB (tested on a 188 GB machine) |
 | Disk | 45 GB for the recommended W4A8 file, on a fast SSD |
-| ComfyUI | a current version. Tested with its dynamic VRAM streaming (`comfy-aimdo`), which is what makes a single consumer card practical |
+| ComfyUI | a current version (from late September 2026: the quantized expert banks load through its own bank layout). Tested with its dynamic VRAM streaming (`comfy-aimdo`), which is what makes a single consumer card practical |
 
 HunyuanImage-3.0 is a *mixture-of-experts* model: 80B parameters in total, 13B used per step. Only a slice fits
 on the GPU at any time, so the rest streams from system RAM over PCIe on every step. That's why RAM and bus
@@ -241,6 +241,12 @@ repeats the setting edit with prompt rewriting, which reads the input image befo
   about 1 megapixel (**Scale Image to Total Pixels → Get Image Size**); a **Resolutions** node gives a fixed size.
 - `vit_strength` and `latent_strength` (both 1.0 by default) tune how strongly the input images steer the
   result.
+- `reference_vit_padding` (on by default) pads each image's tower run to the checkpoint's 1024 tower
+  slots, matching the reference processor. Workflows saved before this input existed get the default
+  (on); switch it off for this pack's original compact tower runs.
+- Image-block RoPE positions are whole numbers, as in the reference (`build_2d_rope`'s `.long()`). Earlier
+  versions used half-steps for grids with an odd `w·h−w` or `w·h−h`, e.g. a 39×26 tower grid; such images
+  and output sizes render slightly differently now, whatever the toggle.
 - Each extra image makes every step slower, since the model reads all of them at every step.
 
 ## Spectrum: up to 3.4× faster sampling

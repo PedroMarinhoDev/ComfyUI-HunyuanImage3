@@ -345,9 +345,13 @@ class _Writer:
             self.tokens.append(self.ids["timestep_r"])
         return positions
 
-    def cond_image(self, image_size, patch_grid, base_size):
+    def cond_image(self, image_size, patch_grid, base_size, reference_vit_padding=False):
         """One conditioning image: its VAE run and its tower run, joined by `<joint_img_sep>` inside one
-        bidirectional block, with the image meta tokens but no `<guidance>`/`<timestep_r>` (spec §44)."""
+        bidirectional block, with the image meta tokens but no `<guidance>`/`<timestep_r>` (spec §44).
+
+        With `reference_vit_padding` the tower run is padded with `<img>` to the checkpoint's 1024
+        tower slots, which is what the reference's processor emits (`image_processor.py:139,276`); the
+        run's true grid stays in the block dict for the tower path."""
         geometry = ImageGeometry(image_size, base_size=base_size, extra_rows=self.extra_rows)
         patch_height, patch_width = patch_grid
         if patch_height * patch_width > COND_PATCH_LIMIT:
@@ -361,6 +365,8 @@ class _Writer:
         self.tokens.append(self.ids["joint_img_sep"])
         vit_start = len(self.tokens)
         self.tokens += [self.ids["img"]] * (patch_height * patch_width)
+        if reference_vit_padding:
+            self.tokens += [self.ids["img"]] * (COND_PATCH_LIMIT - patch_height * patch_width)
         vit_end = len(self.tokens)
         self.tokens.append(self.ids["eoi"])
         return {
@@ -376,7 +382,8 @@ class _Writer:
             "image_width": geometry.width,
         }
 
-    def user_section(self, affixes, system_prompt, prompt, cond_images, base_size):
+    def user_section(self, affixes, system_prompt, prompt, cond_images, base_size,
+                     reference_vit_padding=False):
         """`<bos>`, the system prompt, then the user turn: the conditioning images first and the prompt
         after them, which is the reference's order. `prepare_model_inputs` strips the system prompt one
         frame up (distil_modeling:3263), and an empty one — the base's default — contributes nothing."""
@@ -386,7 +393,8 @@ class _Writer:
         self.text((system_prompt or "").strip())
         self.text(affixes.system_suffix)
         self.text(affixes.user_prefix)
-        blocks = [self.cond_image(size, grid, base_size) for size, grid in cond_images]
+        blocks = [self.cond_image(size, grid, base_size, reference_vit_padding)
+                  for size, grid in cond_images]
         self.user_text(prompt)
         self.text(affixes.user_suffix)
         self.text(affixes.bot_prefix)
@@ -395,7 +403,8 @@ class _Writer:
 
 def build_sequence(tokenizer, prompt, image_size, system_prompt, cot_text=None, base_size=1024,
                    max_position_embeddings=DEFAULT_MAX_POSITION_EMBEDDINGS, *, cfg_distilled,
-                   use_meanflow, sequence_template="instruct", cond_images=(), uncond=False, extra_rows=True):
+                   use_meanflow, sequence_template="instruct", cond_images=(), uncond=False, extra_rows=True,
+                   reference_vit_padding=False):
     """Encode one image request — text to image, or conditioned on up to three images — into ids.
 
     `cond_images` is a list of `((height, width), (patch_height, patch_width))`, one per conditioning
@@ -412,7 +421,8 @@ def build_sequence(tokenizer, prompt, image_size, system_prompt, cot_text=None, 
     geometry = ImageGeometry(image_size, base_size=base_size, extra_rows=extra_rows)
     affixes = Affixes(sequence_template)
     writer = _Writer(tokenizer, ids, uncond, extra_rows)
-    blocks = writer.user_section(affixes, system_prompt, prompt, cond_images, base_size)
+    blocks = writer.user_section(affixes, system_prompt, prompt, cond_images, base_size,
+                                 reference_vit_padding)
     if cot_text:
         # the CoT text is the assistant's text section and takes no `<answer>`; the token belongs to the
         # generated-image section that follows it (`answer == "auto"` promotes it in the instruct

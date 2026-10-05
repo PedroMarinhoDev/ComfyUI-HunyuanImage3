@@ -279,3 +279,74 @@ def test_conditioning_images_are_sized_like_the_reference():
     # 1200x800 -> the 1216x832 row (the reference's own processor, captured); 640x960 is scaled up
     assert tuple(_resize_and_crop(torch.rand(1, 800, 1200, 3), 1216, 832).shape) == (1, 832, 1216, 3)
     assert tuple(_resize_and_crop(torch.rand(1, 960, 640, 3), 832, 1216).shape) == (1, 1216, 832, 3)
+
+
+def test_reference_vit_padding_input_is_last_and_on_by_default():
+    from comfy_extras.nodes_hunyuan_image_3 import HunyuanImage3ImageEncode
+    inputs = _inputs(HunyuanImage3ImageEncode)
+    assert list(inputs)[-1] == "reference_vit_padding"
+    assert getattr(inputs["reference_vit_padding"], "default", None) is True
+
+
+GEN_IMAGE_CAPTURE_PATH = os.environ.get(
+    "HUNYUAN_IMAGE_3_GEN_IMAGE_CAPTURE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dev",
+                 "gen_image_cond_sequences.pt"))
+needs_gen_image_capture = pytest.mark.skipif(
+    not os.path.exists(GEN_IMAGE_CAPTURE_PATH),
+    reason="set HUNYUAN_IMAGE_3_GEN_IMAGE_CAPTURE to dev/capture_gen_image_cond.py's capture")
+
+
+@needs_tokenizer
+@needs_gen_image_capture
+def test_padded_image_stage_sequences_match_the_reference(tokenizer):
+    """1-3 non-square conditioning images, image stage, id for id against the reference.
+
+    The capture (`dev/capture_gen_image_cond.py` in the HY-WU repo, same pattern as
+    `dev/step12_multi_image_sequence.py`) holds the reference's own `preprocess_inputs`
+    ids for the image stage; the padded builder must reproduce them exactly.
+    """
+    from comfy.ldm.hunyuan_image_3.tokenizer import build_sequence
+    capture = torch.load(GEN_IMAGE_CAPTURE_PATH, weights_only=False, map_location="cpu")
+    checked = 0
+    for name, case in capture["cases"].items():
+        cond_images = [(tuple(size), tuple(grid))
+                       for size, grid in zip(case["cond_vae_sizes"], case["cond_vit_grids"])]
+        ids = build_sequence(tokenizer, capture["prompt"], capture["image_size"],
+                             capture["system_prompt"], cond_images=cond_images,
+                             cfg_distilled=False, use_meanflow=False,
+                             reference_vit_padding=True)["ids"]
+        assert ids.tolist() == case["ids"], name
+        checked += 1
+    assert checked == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the quantized kernels need CUDA")
+@pytest.mark.parametrize("fmt", ["w4a8", "int8_convrot"])
+def test_a_published_bank_loads_and_runs_on_this_comfyui(fmt):
+    """Layer 0's expert bank from a published file, through the installed ComfyUI's quantized ops: the
+    core's expert path and the pack's one-expert decode path must agree, and match the dequantized
+    weight. A ComfyUI that changes its bank layout breaks this before it breaks a render."""
+    import comfy.ops
+    from safetensors import safe_open
+
+    from comfy.ldm.hunyuan_image_3.loader import shared_codebooks
+    from comfy.ldm.hunyuan_image_3.ops import expert_linear_sliced
+
+    path = os.path.join(MODELS_DIR, f"hunyuan_image_3_instruct_distil_{fmt}.safetensors")
+    if not os.path.exists(path):
+        pytest.skip(f"{os.path.basename(path)} not present")
+    prefix = "model.layers.0.mlp.experts_down_proj."
+    with safe_open(path, "pt") as handle:
+        state_dict = {key[len(prefix):]: handle.get_tensor(key) for key in handle.keys() if key.startswith(prefix)}
+    shared_codebooks(state_dict)
+    host = torch.nn.Module()
+    host.bank = comfy.ops.mixed_precision_ops({}, torch.bfloat16).MoEExperts(64, 3072, 4096, bias=False, device="cpu")
+    host.load_state_dict({f"bank.{key}": value for key, value in state_dict.items()}, strict=False)
+
+    x = torch.randn(5, 3072, device="cuda", dtype=torch.bfloat16)
+    for expert in (0, 63):
+        reference = x.float() @ host.bank.expert_weight(expert).dequantize().to("cuda").float().T
+        core = host.bank.expert_linear(x, expert)
+        assert torch.equal(core, expert_linear_sliced(host.bank, x, expert))
+        assert ((core.float() - reference).norm() / reference.norm()).item() < 0.02

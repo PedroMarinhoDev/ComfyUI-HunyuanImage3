@@ -23,7 +23,7 @@ PACK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # helper module between files
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# `comfy` must import before the pack does: the pack's `compat` patches `comfy.ops` on import.
+# `comfy` must import before the pack does.
 if importlib.util.find_spec("comfy") is None:                     # pragma: no cover - env guard
     raise RuntimeError(
         "ComfyUI is not importable. Run with PYTHONPATH pointing at your ComfyUI checkout, e.g.\n"
@@ -48,6 +48,9 @@ from comfy.cli_args import args as cli_args
 
 if not torch.cuda.is_available():
     cli_args.cpu = True
+# The attention tests run tiny fp32 inputs on the CPU against the reference math; an installed xformers
+# would otherwise be selected and cannot run them.
+cli_args.disable_xformers = True
 
 
 def _load_pack():

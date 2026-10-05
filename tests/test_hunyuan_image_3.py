@@ -79,8 +79,9 @@ def reference_rope_angles(seq_len, head_dim, image_section=None):
             start = image_section[0].start
             height, width = image_section[1]
             offset = token - start
-            y = start + (width * height - height) / 2 + offset // width
-            x = start + (width * height - width) / 2 + offset % width
+            # the reference truncates the grid positions to integers (`build_2d_rope`: `x_pos.long()`)
+            y = int(start + (width * height - height) / 2 + offset // width)
+            x = int(start + (width * height - width) / 2 + offset % width)
         else:
             y = x = token
         for k in range(pairs):

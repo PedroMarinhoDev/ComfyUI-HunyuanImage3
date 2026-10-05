@@ -293,3 +293,103 @@ def test_the_size_token_is_derived_from_the_requested_area():
         assert geometry.base_size == base, f"{size} chose base {geometry.base_size}, expected {base}"
         assert geometry.image_token_length == tokens, \
             f"{size} has {geometry.image_token_length} image tokens, expected {tokens}"
+
+
+COND_GEOMETRY = ((1216, 832), (39, 26))  # the reviewer's test image: 1014 tower patches
+PLAIN_FLAGS = {"cfg_distilled": False, "use_meanflow": False}
+
+
+def _cond_sequence(tokenizer, **overrides):
+    flags = dict(PLAIN_FLAGS)
+    flags.update(overrides)
+    return _build_sequence(tokenizer, PROMPT, "1024x1024", UNIFIED_SYSTEM_PROMPT_EN,
+                           cond_images=[COND_GEOMETRY], **flags)
+
+
+@needs_tokenizer
+def test_compact_tower_runs_are_still_the_default(tokenizer):
+    """`reference_vit_padding` off (the default) keeps the true-grid tower run."""
+    blocks = _cond_sequence(tokenizer)["cond_blocks"]
+    assert len(blocks) == 1
+    vit = blocks[0]["vit_slice"]
+    assert vit.stop - vit.start == 39 * 26
+
+
+@needs_tokenizer
+def test_reference_vit_padding_pads_the_tower_run(tokenizer):
+    """On: the tower run is 1024 `<img>` — the default ids with the pads spliced out."""
+    default = _cond_sequence(tokenizer)
+    padded = _cond_sequence(tokenizer, reference_vit_padding=True)
+    dflt, pad = default["cond_blocks"][0], padded["cond_blocks"][0]
+    assert pad["vit_slice"].stop - pad["vit_slice"].start == 1024
+    assert (pad["patch_height"], pad["patch_width"]) == (39, 26)
+    assert pad["joint_slice"].stop - pad["joint_slice"].start == \
+        (dflt["joint_slice"].stop - dflt["joint_slice"].start) + (1024 - 39 * 26)
+    img = tokenizer.token_to_id("<img>")
+    ids_d, ids_p = default["ids"].tolist(), padded["ids"].tolist()
+    assert len(ids_p) - len(ids_d) == 1024 - 39 * 26
+    vit_start = pad["vit_slice"].start
+    assert ids_p[vit_start + 39 * 26:vit_start + 1024] == [img] * (1024 - 39 * 26)
+    assert ids_p[:vit_start + 39 * 26] + ids_p[vit_start + 1024:] == ids_d
+
+
+def test_rope_grid_positions_are_truncated_to_integers():
+    """The reference's `.long()`: beta_y = 5000 + (1014 - 39) / 2 = 5487.5 becomes 5487."""
+    import math
+    from comfy.ldm.hunyuan_image_3.model import build_rope_freqs
+    info = [(slice(5000, 5000 + 1014), (39, 26))]
+    freqs = build_rope_freqs(6252, 128, info, 10000.0)
+    # pair 0 uses the y position at theta_0 = 1
+    assert abs(freqs[0, 0, 5000, 0, 0, 0].item() - math.cos(5487)) < 1e-4
+
+
+@needs_tokenizer
+def test_padded_sequence_feeds_mask_and_rope(tokenizer):
+    """The padded sequence survives `_sequence_from_ids`, the mask and the RoPE builders."""
+    import types
+    from comfy.ldm.hunyuan_image_3.model import _sequence_from_ids, build_rope_freqs
+    from comfy.ldm.hunyuan_image_3.pipeline import build_attention_mask
+    seq = _cond_sequence(tokenizer, reference_vit_padding=True)
+    img = tokenizer.token_to_id("<img>")
+    config = types.SimpleNamespace(image_token_id=img, cfg_distilled=False, use_meanflow=False)
+    gen_latent = torch.zeros(1, 16, 64, 64)
+    cond_latent = [torch.zeros(1, 16, 76, 52)]
+    step = _sequence_from_ids(seq["ids"], gen_latent, config, cond_latent=cond_latent,
+                              cond_patch_grid=[torch.tensor([39, 26])])
+    assert step["cond_blocks"][0]["vit_slice"].stop - step["cond_blocks"][0]["vit_slice"].start == 1024
+    seq_len = seq["ids"].shape[0]
+    mask = build_attention_mask(step, seq_len, torch.bfloat16, torch.device("cpu"))
+    assert tuple(mask.shape[-2:]) == (seq_len, seq_len)
+    freqs = build_rope_freqs(seq_len, 128, step["rope_image_info"], 10000.0)
+    assert freqs.shape[2] == seq_len
+
+
+ROPE_CAPTURE_PATH = os.environ.get(
+    "HUNYUAN_IMAGE_3_ROPE_CAPTURE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dev",
+                 "reference_rope_padded_39x26.pt"))
+needs_rope_capture = pytest.mark.skipif(
+    not os.path.exists(ROPE_CAPTURE_PATH),
+    reason="set HUNYUAN_IMAGE_3_ROPE_CAPTURE to dev/p1a_ref_rope.py's capture (reference_rope_padded_39x26.pt)")
+
+
+@needs_rope_capture
+def test_truncated_rope_matches_the_reference_table():
+    """`build_rope_freqs` == the reference `build_2d_rope` cos/sin.
+
+    The capture is a real img1 case (padded 39x26 tower run, base 10000, head_dim 128).
+    The reference stores each row's 64 angles twice (`repeat(1, 2)` tiles the row, so the
+    first half holds the unique angles) in the same y-even/x-odd order the pack builds,
+    so the first halves compare directly, to fp32 rounding.
+    """
+    from comfy.ldm.hunyuan_image_3.model import build_rope_freqs
+    capture = torch.load(ROPE_CAPTURE_PATH, weights_only=False, map_location="cpu")
+    seq_len = capture["seq_len"]
+    info = [(slice(*capture["vae"]), (76, 52)), (slice(*capture["vit"]), (39, 26))]
+    freqs = build_rope_freqs(seq_len, 128, info, 10000.0)
+    pack_cos = freqs[0, 0, :, :, 0, 0]
+    pack_sin = freqs[0, 0, :, :, 1, 0]
+    ref_cos, ref_sin = capture["cos"][:, :64], capture["sin"][:, :64]
+    assert pack_cos.shape == ref_cos.shape == (seq_len, 64)
+    assert torch.allclose(pack_cos, ref_cos, atol=1e-5)
+    assert torch.allclose(pack_sin, ref_sin, atol=1e-5)

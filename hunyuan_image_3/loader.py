@@ -110,6 +110,16 @@ class _OpsConfig:
         self.quant_config = quant_config
 
 
+def shared_codebooks(state_dict):
+    """One W4A8 codebook per bank. The published files store a bank's Lloyd-Max table once per expert
+    (`[E, 16]`), every converted bank uses the same table, and ComfyUI's flat bank layout takes one."""
+    for key in [key for key in state_dict if key.endswith("weight_codebook") and state_dict[key].ndim == 2]:
+        table = state_dict[key]
+        if not torch.equal(table, table[:1].expand_as(table)):
+            raise ValueError(f"{key}: the experts' codebooks differ, and ComfyUI's W4A8 banks take one table")
+        state_dict[key] = table[0].clone()
+
+
 def _patcher_factory(checkpoint_path, disable_dynamic=False):
     """What `cached_patcher_init` calls: a freshly loaded patcher, nothing else.
 
@@ -137,6 +147,7 @@ def load_hunyuan_image_3(checkpoint_path, disable_dynamic=False):
     head_keys = [key for key in state_dict if key.startswith(HEAD_PREFIXES)]
     for key in head_keys:
         del state_dict[key]
+    shared_codebooks(state_dict)
     model_type = detect_model_type(state_dict, checkpoint_path)
     logging.info("HunyuanImage3: %s is the %s checkpoint%s", os.path.basename(checkpoint_path), model_type,
                  "; its built-in text head is not used" if head_keys else "")

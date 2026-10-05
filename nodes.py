@@ -209,7 +209,43 @@ def _resize_and_crop(image, width, height):
     return resized[:, :, top:top + height, left:left + width].movedim(1, -1)
 
 
-def _condition_on_image(model, image, vae, clip_vision, config, vit_strength, latent_strength):
+def _padded_tower_tokens(clip_vision, pixels, patch_height, patch_width):
+    """The tower's tokens for one image padded to `COND_PATCH_LIMIT`, reference-style.
+
+    The reference's processor emits a full 1024-slot tower run per image: the grid's own
+    patches, then zero patch rows with the first position embedding and excluded from the
+    tower's key side (`image_processor.py:139,276`, `siglip2.py:128-145`). The nearest
+    pack-native equivalent: the valid grid's own positioned tokens, one pad token built
+    from a zero patch plus the interpolated position table's row 0, the encoder run with a
+    keys-only mask over all 1024 (a format every ComfyUI attention backend honors), then the
+    final norm — whose pad row is repeated over the pad slots. Returns `(1, 1024, 1152)`.
+
+    This bypasses `CLIPVision.forward` (which hardcodes `mask=None` one frame above its own
+    mask-capable encoder) but calls only the tower's own submodules in their own order.
+    """
+    vision_model = clip_vision.model.vision_model
+    embeddings = vision_model.embeddings
+    positioned = embeddings(pixels)
+    grid_len = patch_height * patch_width
+    pad_len = COND_PATCH_LIMIT - grid_len
+    # a zero patch through the same projection as the image's own patches, plus the position table's
+    # first row; built on the pixels' device, since a streamed tower keeps its weights in RAM
+    pad_patch = embeddings.patch_embedding(
+        torch.zeros(1, 1, embeddings.patch_embedding.in_features, device=pixels.device, dtype=pixels.dtype))
+    pos_table = comfy.clip_model.siglip2_pos_embed(embeddings.position_embedding.weight, torch.zeros_like(positioned),
+                                                   (patch_height, patch_width))
+    pad_row = pad_patch + pos_table[:, :1]
+    full = torch.cat([positioned, pad_row.expand(1, pad_len, -1)], dim=1)
+    mask = torch.zeros(1, COND_PATCH_LIMIT, dtype=torch.bool, device=positioned.device)
+    mask[:, :grid_len] = True
+    encoded, _ = vision_model.encoder(full, mask=mask, intermediate_output=-2)
+    normed = vision_model.post_layernorm(encoded)
+    return torch.cat([normed[:, :grid_len, :],
+                      normed[:, grid_len:grid_len + 1, :].expand(1, pad_len, -1)], dim=1)
+
+
+def _condition_on_image(model, image, vae, clip_vision, config, vit_strength, latent_strength,
+                        reference_vit_padding=False):
     """One conditioning image: its latent, its tower tokens, and the sizes its sequence block needs.
 
     The VAE sees the image resized and center-cropped to the nearest size in the model's resolution
@@ -238,6 +274,11 @@ def _condition_on_image(model, image, vae, clip_vision, config, vit_strength, la
     patch_height, patch_width = (size // patch_size for size in pixels.shape[-2:])
     assert tokens.shape[1] == patch_height * patch_width, \
         f"the tower returned {tokens.shape[1]} tokens for a {patch_height}x{patch_width} grid"
+    if reference_vit_padding and patch_height * patch_width < COND_PATCH_LIMIT:
+        tokens = _padded_tower_tokens(clip_vision, pixels, patch_height, patch_width)
+        tokens = tokens.to(comfy.model_management.intermediate_device())
+        assert tokens.shape[1] == COND_PATCH_LIMIT, \
+            f"padded tower run has {tokens.shape[1]} tokens, not {COND_PATCH_LIMIT}"
     cond_vit = model.model.diffusion_model.vision_aligner(tokens.to(cond_latent.dtype)) * vit_strength
     return {
         "latent": cond_latent,
@@ -247,7 +288,8 @@ def _condition_on_image(model, image, vae, clip_vision, config, vit_strength, la
     }
 
 
-def _encode(model, prompt, width, height, custom_system_prompt, rewriting, conds=()):
+def _encode(model, prompt, width, height, custom_system_prompt, rewriting, conds=(),
+            reference_vit_padding=True):
     """Positive and negative conditioning for one request, and the rewritten prompt if there is one.
 
     The negative is the reference's unconditional pass for the same request: the prompt (and any CoT
@@ -292,7 +334,8 @@ def _encode(model, prompt, width, height, custom_system_prompt, rewriting, conds
                                   max_position_embeddings=config.max_position_embeddings,
                                   cfg_distilled=config.cfg_distilled, use_meanflow=config.use_meanflow,
                                   sequence_template=config.sequence_template, cond_images=cond_images,
-                                  uncond=uncond, extra_rows=config.model_type != "base")
+                                  uncond=uncond, extra_rows=config.model_type != "base",
+                                  reference_vit_padding=reference_vit_padding)
         return [[None, dict(cond_meta, ids=sequence["ids"])]]
 
     return IO.NodeOutput(conditioning(False), conditioning(True), rewritten)
@@ -369,21 +412,29 @@ class HunyuanImage3ImageEncode(IO.ComfyNode):
                 IO.Float.Input("latent_strength", default=1.0, min=0.0, max=2.0, step=0.01, advanced=True,
                                tooltip="Scales the images' latent contribution. 1.0 is the reference's "
                                        "behaviour."),
+                IO.Boolean.Input("reference_vit_padding", default=True, advanced=True,
+                                 tooltip="Pad each image's tower run to the checkpoint's 1024 tower slots, "
+                                         "as the reference processor does. Off uses only the image's own "
+                                         "patches (this pack's earlier behaviour). Workflows saved before "
+                                         "this input existed get the default (on)."),
             ],
             outputs=ENCODE_OUTPUTS,
         )
 
     @classmethod
     def execute(cls, model, vae, clip_vision, images, prompt, width, height, prompt_rewriting=None,
-                custom_system_prompt=None, vit_strength=1.0, latent_strength=1.0) -> IO.NodeOutput:
+                custom_system_prompt=None, vit_strength=1.0, latent_strength=1.0,
+                reference_vit_padding=True) -> IO.NodeOutput:
         config = model.model.diffusion_model.config
         if config.model_type == "base":
             raise ValueError("the base checkpoint only does text to image; use the HunyuanImage 3.0 Text "
                              "Encode node, or load Instruct or Instruct-Distil for editing")
         ordered = [images[name] for name in IMAGE_NAMES if images.get(name) is not None]
-        conds = [_condition_on_image(model, image, vae, clip_vision, config, vit_strength, latent_strength)
+        conds = [_condition_on_image(model, image, vae, clip_vision, config, vit_strength, latent_strength,
+                                     reference_vit_padding)
                  for image in ordered]
-        return _encode(model, prompt, width, height, custom_system_prompt, prompt_rewriting, conds)
+        return _encode(model, prompt, width, height, custom_system_prompt, prompt_rewriting, conds,
+                       reference_vit_padding)
 
 
 class HunyuanImage3Guidance(IO.ComfyNode):

@@ -283,9 +283,13 @@ def build_rope_freqs(seq_len, head_dim, rope_image_info, base, device=None):
 
     Text and special tokens use their sequence index for both axes. An image block starting at
     token L with token grid (height, width) uses a row major meshgrid over
-    y = L + (w * h - h) / 2 + row and x = L + (w * h - w) / 2 + column. Rope pair k uses the y
+    y = L + (w * h - h) // 2 + row and x = L + (w * h - w) // 2 + column. Rope pair k uses the y
     position for even k and the x position for odd k, at frequency base ** (-2 * k / head_dim). A
     grid wider than the trained one raises the base before the frequencies are built.
+
+    The grid positions are truncated to integers, as the reference's `build_2d_rope` does
+    (`x_pos.long()`): a grid with an odd `w * h - h` or `w * h - w` (a 39x26 tower grid centres at
+    L + 487.5) would otherwise sit at half-integer phases the reference never uses.
     """
     pairs = head_dim // 2
     positions = torch.zeros(seq_len, 2, dtype=torch.float32, device=device)
@@ -301,8 +305,8 @@ def build_rope_freqs(seq_len, head_dim, rope_image_info, base, device=None):
         beta_y = start + (width * height - height) / 2
         beta_x = start + (width * height - width) / 2
         index = torch.arange(height * width, dtype=torch.float32, device=device)
-        positions[start:start + height * width, 0] = beta_y + torch.div(index, width, rounding_mode="floor")
-        positions[start:start + height * width, 1] = beta_x + index % width
+        positions[start:start + height * width, 0] = (beta_y + torch.div(index, width, rounding_mode="floor")).trunc()
+        positions[start:start + height * width, 1] = (beta_x + index % width).trunc()
         last_pos = start + height * width
     positions[last_pos:, 0] = text_positions[last_pos:]
     positions[last_pos:, 1] = text_positions[last_pos:]

@@ -26,9 +26,6 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# the package root, so the converter can pick up `compat` — the same shim the runtime applies, since the
-# bank params class it needs is not in a stock checkout
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from comfy_kitchen.tensor.base import QuantizedTensor
 from comfy_kitchen.tensor.w4a8_int8 import AsymW4A8Int8Layout
@@ -67,43 +64,34 @@ def file_tensor(tensor):
 
 def quantize_module(reader, module, source, is_bank, device):
     """Returns (module, {key suffix: tensor}) with the layout already applied."""
-    # where the upstream fix is present this is core's own class; where it is not, `compat` supplies it.
-    # The converter has to go through the shim rather than reaching into comfy.ops directly, so it builds
-    # the layout the loader will actually accept on the checkout the package is installed into
-    import compat  # noqa: F401  (import for its side effect: it patches comfy.ops)
-    from comfy.ops import _bank_params_class
-
-    ops = scratch_ops()
     if is_bank:
+        # written directly in the file layout the loader reads: [E, ...] per field, and one codebook
+        # table for the bank, which is what ComfyUI's flat bank layout takes
         layer, projection = bank_projection(module)
-        per_expert = [reader.tensor(reader.expert_key(layer, index, projection)).to(device)
-                      for index in range(64)]
-        quantized = [AsymW4A8Int8Layout.quantize(weight, group_size=GROUP_SIZE,
-                                                 convrot_groupsize=CONVROT_GROUP_SIZE)
-                     for weight in per_expert]
-        fields = {}
-        for name in ("scale", "s_channel", "correction", "codebook"):
-            values = [getattr(params, name) for _, params in quantized]
-            if values[0] is None:
-                fields[name] = None
-            else:
-                fields[name] = torch.stack([value.cpu() for value in values])
-        shape = per_expert[0].shape
-        params_cls = _bank_params_class(AsymW4A8Int8Layout)
-        params = params_cls(scale=fields["scale"], s_channel=fields["s_channel"],
-                            correction=fields["correction"], codebook=fields["codebook"],
-                            group_size=GROUP_SIZE, convrot_groupsize=CONVROT_GROUP_SIZE,
-                            orig_dtype=torch.bfloat16, orig_shape=(64,) + tuple(shape))
-        qdata = torch.stack([entry[0].cpu() for entry in quantized])
-        module_op = ops.MoEExperts(64, shape[1], shape[0], bias=False, dtype=torch.bfloat16)
-    else:
-        weight = reader.tensor(source).to(device)
-        qdata, params = AsymW4A8Int8Layout.quantize(weight, group_size=GROUP_SIZE,
-                                                    convrot_groupsize=CONVROT_GROUP_SIZE)
-        qdata = qdata.cpu()
-        params = params.to_device(torch.device("cpu"))
-        shape = weight.shape
-        module_op = ops.Linear(shape[1], shape[0], bias=False, dtype=torch.bfloat16)
+        quantized = [AsymW4A8Int8Layout.quantize(reader.tensor(reader.expert_key(layer, index, projection)).to(device),
+                                                 group_size=GROUP_SIZE, convrot_groupsize=CONVROT_GROUP_SIZE)
+                     for index in range(64)]
+        params = [entry[1] for entry in quantized]
+        if params[0].correction is not None:
+            raise ValueError(f"{module}: W4A8 banks with a correction term are not supported")
+        codebook = params[0].codebook
+        if codebook is not None and not all(torch.equal(p.codebook, codebook) for p in params):
+            raise ValueError(f"{module}: the experts' codebooks differ, and ComfyUI's W4A8 banks take one table")
+        conf = {"format": FORMAT, "group_size": GROUP_SIZE, "convrot_groupsize": CONVROT_GROUP_SIZE, "num_experts": 64}
+        entries = {
+            "weight": torch.stack([entry[0].cpu() for entry in quantized]),
+            "weight_s_rel": file_tensor(torch.stack([p.scale.cpu() for p in params])),
+            "weight_s_channel": torch.stack([p.s_channel.cpu() for p in params]),
+            "comfy_quant": torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8),
+        }
+        if codebook is not None:
+            entries["weight_codebook"] = codebook.cpu()
+        return module, entries
+    weight = reader.tensor(source).to(device)
+    qdata, params = AsymW4A8Int8Layout.quantize(weight, group_size=GROUP_SIZE, convrot_groupsize=CONVROT_GROUP_SIZE)
+    qdata = qdata.cpu()
+    params = params.to_device(torch.device("cpu"))
+    module_op = scratch_ops().Linear(weight.shape[1], weight.shape[0], bias=False, dtype=torch.bfloat16)
 
     module_op.quant_format = FORMAT
     module_op.layout_type = "AsymW4A8Int8Layout"

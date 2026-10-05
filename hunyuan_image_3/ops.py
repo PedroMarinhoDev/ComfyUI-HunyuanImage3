@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 import comfy.ops
-from comfy.quant_ops import QuantizedTensor
+from comfy.quant_ops import QUANT_ALGOS, QuantizedTensor
 
 
 class MoEExperts(comfy.ops.disable_weight_init.Linear):
@@ -71,13 +71,16 @@ class QuantlessMoEOps(comfy.ops.disable_weight_init):
 # ------------------------------------------------------------------- per-expert fetch for decode steps
 
 def _matmul(module, input, weight, bias):
-    """The GEMM of `MoEExperts._expert_matmul`, for cores that predate that method."""
+    """The GEMM of the core's `MoEExperts._expert_linear_impl`, on an expert view already on the device."""
     if isinstance(weight, QuantizedTensor):
         use_fast = (not module._full_precision_mm
                     and weight.layout_cls.supports_fast_matmul()
                     and input.dim() == 2)
         if use_fast:
-            return F.linear(QuantizedTensor.from_float(input, module.layout_type), weight, bias)
+            # weight-only layouts (W4A8) quantize the activation inside their kernel
+            if QUANT_ALGOS[module.quant_format].get("quantize_input", True):
+                input = QuantizedTensor.from_float(input, module.layout_type)
+            return F.linear(input, weight, bias)
         out = input @ weight.dequantize().t()
         return out + bias if bias is not None else out
     return F.linear(input, weight, bias)
@@ -110,5 +113,4 @@ def expert_linear_sliced(module, input, i):
     bias = None
     if module.bias is not None:
         bias = comfy.ops.cast_to_input(module.bias[i].to(device), input, copy=False)
-    matmul = getattr(module, "_expert_matmul", None)
-    return matmul(input, weight, bias) if matmul is not None else _matmul(module, input, weight, bias)
+    return _matmul(module, input, weight, bias)

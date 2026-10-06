@@ -161,6 +161,12 @@ Measured on one **RTX 4090** (PCIe 4.0 ×8, 188 GB RAM), 1024×1024, with the se
   didn't fit in the RAM left over on this 188 GB machine, so it streamed from an NVMe drive at about 1 GB/s,
   which is what its ~90 s per step shows. In an earlier run with more RAM free it took about 15 s per step.
   Either way, bf16 is for comparisons, not for everyday use.
+- **The attention backend doesn't change the speed.** The table was measured with `--use-ck-attention`
+  (Comfy Kitchen int8 attention). Re-measured on the same 4090 with PyTorch SDPA, xformers, Comfy Kitchen,
+  Flash and Sage, the Instruct-Distil W4A8 ran at 2.5–2.6 s per step under every one of them, because the
+  expert weights take the time, not attention. (That's also faster than the table's 3.1 s: ComfyUI and
+  comfy-kitchen got quicker since it was measured.) Flash and Sage can't take this model's attention mask and
+  fall back to SDPA. Switching backends changes fine details in an image, not its quality.
 
 ### Smaller GPUs
 
@@ -321,6 +327,9 @@ and ~45 GB of free RAM. Existing outputs are skipped, so an interrupted run can 
 - **"Missing VAE keys … temb_proj" in the log**: harmless, printed while the VAE loads.
 - **The VAE isn't found after updating**: it's now `hunyuan_image_3_vae_fp16.safetensors`, one file for all
   three models.
+- **"Flash Attention failed, using default SDPA" over and over in the log**: harmless with
+  `--use-flash-attention`. This model's attention needs a mask, which Flash can't take; drop the flag to
+  silence it.
 - **Out of memory / very slow**: close other GPU apps; W4A8 needs the least RAM and VRAM.
 - **Prompt rewriting returns nothing**: you're on the Base model, or the token budget ran out: raise
   `max_new_tokens` to 512–768.

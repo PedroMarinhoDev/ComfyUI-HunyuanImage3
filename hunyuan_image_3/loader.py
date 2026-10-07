@@ -177,7 +177,13 @@ def load_hunyuan_image_3(checkpoint_path, disable_dynamic=False):
     # plain ModelPatcher alias before that happens — silently, with no log line, on exactly the large
     # offloaded models this loader exists for
     patcher_class = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
-    patcher = patcher_class(model, load_device=load_device, offload_device=offload_device)
+    # Stream weights file -> VRAM ("fast disk") instead of core building a second, pinned,
+    # retained RAM copy of the whole 45 GB checkpoint in front of the dynamic loader. My NVMe
+    # sits behind a mergerfs mount, which core's auto-detection cannot see through, so pass it
+    # explicitly; --disable-fast-disk remains the opt-out.
+    from comfy.cli_args import args as _cli_args  # not `import comfy.x`: that would make `comfy` function-local
+    fast_disk = not _cli_args.disable_fast_disk
+    patcher = patcher_class(model, load_device=load_device, offload_device=offload_device, fast_disk=fast_disk)
     patcher.cached_patcher_init = (_patcher_factory, (checkpoint_path,))
 
     # the converted file carries this port's key names already

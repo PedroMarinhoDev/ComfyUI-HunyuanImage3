@@ -82,7 +82,7 @@ def _alias(name, module):
 _load_pack()
 
 _alias("comfy.ldm.hunyuan_image_3", importlib.import_module("hy3pack.hunyuan_image_3"))
-for _name in ("loader", "model", "model_base", "ops", "pipeline", "rewrite", "system_prompt", "tokenizer", "vae"):
+for _name in ("grouped_moe", "loader", "model", "model_base", "ops", "pipeline", "rewrite", "system_prompt", "tokenizer", "vae"):
     _alias(f"comfy.ldm.hunyuan_image_3.{_name}",
            importlib.import_module(f"hy3pack.hunyuan_image_3.{_name}"))
 

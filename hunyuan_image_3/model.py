@@ -16,6 +16,7 @@ import contextlib
 
 from comfy.ldm.modules.attention import optimized_attention_masked
 
+from . import grouped_moe
 from .lookahead import LayerLookahead
 from .ops import expert_linear_sliced
 
@@ -611,6 +612,14 @@ class HunyuanImage3MoE(nn.Module):
         # the bank for every one of them (see `ops.expert_linear_sliced`)
         linear = _bank_linear if full_bank else expert_linear_sliced
         with gate_up_bank as gate_up_experts, down_bank as down_experts:
+            # int8 ConvRot and W4A8 banks: every expert in one grouped launch per projection, with the
+            # routing weight and scatter fused in; bit-identical to the loop below (see grouped_moe.py)
+            if full_bank:
+                routed = grouped_moe.routed(gate_up_experts, down_experts, self.num_experts, flat,
+                                            token_sorted, dest_sorted, weight_sorted, counts, self.top_k,
+                                            _swiglu)
+                if routed is not None:
+                    return self.shared_mlp(hidden_states) + routed.view(bsz, seq_len, hidden_size)
             start = 0
             for expert_index, count in enumerate(counts):
                 if not count:

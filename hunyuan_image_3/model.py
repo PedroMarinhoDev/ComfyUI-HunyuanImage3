@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 import comfy.model_management
 import comfy.model_patcher
@@ -270,55 +271,234 @@ def _sequence_from_ids(ids, latents, config, cond_latent=None, cond_patch_grid=N
 
 
 # The image grid a 1024 request produces: the checkpoint's resolution table base (1024) over the 16x
-# patch size. The 2D positions of an image block grow with w*h — L+2016 at 64x64, L+4560 at 96x96 —
-# and the reference only ever asks for sizes inside its table, so a wider grid would sit at rope
-# phases the model never saw for image tokens. Legal, but untrained: renders stay plausible while
-# following the prompt less and less. The rope base is rescaled by the grid's growth factor instead,
-# which is what the reference's own `base_rescale_factor` does.
+# patch size. The 2D positions of an image block grow with w*h — L+2016 at 64x64, L+8128 at 128x128 —
+# so a bigger grid puts its image tokens at text-to-image distances the model never saw, and the
+# reference only ever asks for sizes inside its table. Unscaled, a 2048x2048 render is noise. The rope
+# base is rescaled by the growth in area (the side's growth was too weak: still noise at 2048, text lost
+# at 1536), with the reference's own `base_rescale_factor` formula.
 _TRAINED_GRID = 64
 
 
-def build_rope_freqs(seq_len, head_dim, rope_image_info, base, device=None):
+def rope_area_scale(rope_image_info):
+    return max(1.0, max((height * width / _TRAINED_GRID ** 2 for _, (height, width) in rope_image_info), default=1.0))
+
+
+def _bundled(index, first, size):
+    """SPA's bundle map: 0 for the first `first` indices, then one bundle per `size` indices."""
+    return torch.where(index < first, torch.zeros_like(index), torch.div(index - first + size, size, rounding_mode="floor"))
+
+
+def _rope_positions(seq_len, rope_image_info, device, bundle=None):
+    """(seq_len, 2) y/x positions, laid out as `build_rope_freqs` describes. `bundle` = (size, first
+    row, first column) groups the generated (last) block's rows and columns into bundles for SPA; the
+    block is then laid out as the smaller grid, and the tokens after it follow that grid."""
+    positions = torch.zeros(seq_len, 2, dtype=torch.float32, device=device)
+    text_positions = torch.arange(seq_len, dtype=torch.float32, device=device)
+    last_pos, removed = 0, 0
+    for number, (section, (height, width)) in enumerate(rope_image_info):
+        start = section.start
+        positions[last_pos:start] = text_positions[last_pos:start, None]
+        index = torch.arange(height * width, dtype=torch.float32, device=device)
+        rows, columns = torch.div(index, width, rounding_mode="floor"), index % width
+        grid_height, grid_width = height, width
+        if bundle is not None and number == len(rope_image_info) - 1:
+            size, first_row, first_column = bundle
+            rows, columns = _bundled(rows, first_row, size), _bundled(columns, first_column, size)
+            grid_height = int(_bundled(torch.tensor(height - 1), first_row, size)) + 1
+            grid_width = int(_bundled(torch.tensor(width - 1), first_column, size)) + 1
+            removed = height * width - grid_height * grid_width
+        beta_y = start + (grid_width * grid_height - grid_height) / 2
+        beta_x = start + (grid_width * grid_height - grid_width) / 2
+        positions[start:start + height * width, 0] = (beta_y + rows).trunc()
+        positions[start:start + height * width, 1] = (beta_x + columns).trunc()
+        last_pos = start + height * width
+    positions[last_pos:] = text_positions[last_pos:, None] - removed
+    return positions
+
+
+def _rope_table(positions, head_dim, base):
+    pairs = head_dim // 2
+    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=positions.device) / head_dim))
+    angles = positions[:, torch.arange(pairs, device=positions.device) % 2] * theta
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    freqs = torch.stack([torch.stack([cos, -sin], dim=-1), torch.stack([sin, cos], dim=-1)], dim=-2)
+    return freqs.reshape(1, 1, positions.shape[0], pairs, 2, 2)
+
+
+def build_rope_freqs(seq_len, head_dim, rope_image_info, base, device=None, dype_sigma=None, sega=False):
     """2D rope rotation matrices for one sequence, shape (1, 1, seq_len, head_dim // 2, 2, 2).
 
     Text and special tokens use their sequence index for both axes. An image block starting at
     token L with token grid (height, width) uses a row major meshgrid over
     y = L + (w * h - h) // 2 + row and x = L + (w * h - w) // 2 + column. Rope pair k uses the y
     position for even k and the x position for odd k, at frequency base ** (-2 * k / head_dim). A
-    grid wider than the trained one raises the base before the frequencies are built.
+    grid larger than the trained one raises the base before the frequencies are built. With
+    `dype_sigma` the rescale follows the denoising step instead (DyPE, arXiv 2510.20766): the full
+    rescale at sigma 1, relaxing as sigma ** 2 (the paper's lambda_t = 2) toward the unscaled base.
+    With `sega` it is divided by SEGA's 1 + 0.1 ln s, s the grid's growth per side.
 
     The grid positions are truncated to integers, as the reference's `build_2d_rope` does
     (`x_pos.long()`): a grid with an odd `w * h - h` or `w * h - w` (a 39x26 tower grid centres at
     L + 487.5) would otherwise sit at half-integer phases the reference never uses.
     """
-    pairs = head_dim // 2
-    positions = torch.zeros(seq_len, 2, dtype=torch.float32, device=device)
-    text_positions = torch.arange(seq_len, dtype=torch.float32, device=device)
-    grid_scale = max(1.0, max((math.sqrt(height * width) / _TRAINED_GRID
-                               for _, (height, width) in rope_image_info), default=1.0))
-    last_pos = 0
-    for section, (height, width) in rope_image_info:
-        start = section.start
-        if last_pos < start:
-            positions[last_pos:start, 0] = text_positions[last_pos:start]
-            positions[last_pos:start, 1] = text_positions[last_pos:start]
-        beta_y = start + (width * height - height) / 2
-        beta_x = start + (width * height - width) / 2
-        index = torch.arange(height * width, dtype=torch.float32, device=device)
-        positions[start:start + height * width, 0] = (beta_y + torch.div(index, width, rounding_mode="floor")).trunc()
-        positions[start:start + height * width, 1] = (beta_x + index % width).trunc()
-        last_pos = start + height * width
-    positions[last_pos:, 0] = text_positions[last_pos:]
-    positions[last_pos:, 1] = text_positions[last_pos:]
+    area_scale = rope_area_scale(rope_image_info)
+    if area_scale > 1.0:
+        base *= area_scale ** ((1.0 if dype_sigma is None else dype_sigma ** 2) * head_dim / (head_dim - 2))
+        if sega:
+            base /= 1 + 0.05 * math.log(area_scale)
+    return _rope_table(_rope_positions(seq_len, rope_image_info, device), head_dim, base)
 
-    if grid_scale > 1.0:
-        base *= grid_scale ** (head_dim / (head_dim - 2))
-    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-    angles = positions[:, torch.arange(pairs, device=device) % 2] * theta
-    cos = torch.cos(angles)
-    sin = torch.sin(angles)
-    freqs = torch.stack([torch.stack([cos, -sin], dim=-1), torch.stack([sin, cos], dim=-1)], dim=-2)
-    return freqs.reshape(1, 1, seq_len, pairs, 2, 2)
+
+def build_spa_rope_freqs(seq_len, head_dim, rope_image_info, base, device=None):
+    """SPA (HRDiT, arXiv 2608.07003): rope tables that keep a large generated block inside the trained grid.
+
+    The block's rows and columns are grouped into bundles of `size` (the smallest that brings the grid
+    within the trained area), so every bundled position is one the model saw, at the unscaled base.
+    Tokens in a bundle share a position, so the bundle boundary slides: one table with full bundles,
+    then `size - 1` with the first row bundle shortened and `size - 1` with the first column bundle
+    shortened. The attention runs once per table and averages the outputs. Returns the list of
+    tables, or None when the generated block already fits the trained area.
+    """
+    height, width = rope_image_info[-1][1]
+    size = math.ceil(math.sqrt(height * width) / _TRAINED_GRID)
+    if size <= 1:
+        return None
+    firsts = [(size, size)] + [(row, size) for row in range(1, size)] + [(size, column) for column in range(1, size)]
+    return [_rope_table(_rope_positions(seq_len, rope_image_info, device, (size, row, column)), head_dim, base)
+            for row, column in firsts]
+
+
+def _binned(values, bins, n_bins):
+    return (torch.bincount(bins, weights=values, minlength=n_bins)
+            / (torch.bincount(bins, minlength=n_bins) + 1e-8))
+
+
+def _axis_energy(spatial, axis, n_bins):
+    length = spatial.shape[axis]
+    power = torch.fft.fft(spatial, dim=axis).abs().pow(2).mean(dim=1 - axis)[:length // 2 + 1]
+    bins = (torch.linspace(0.0, 1.0, power.shape[0], device=power.device) * n_bins).long().clamp(max=n_bins - 1)
+    return _binned(power, bins, n_bins)
+
+
+def sega_qk_scale(image_embeds, height, width, head_dim, area_scale):
+    """SEGA (arXiv 2605.22668): a per-pair attention temperature from the image tokens' spatial spectrum.
+
+    Each axis's rope pairs, fast to slow, are matched to that axis's FFT bins, high to low frequency.
+    Pairs whose band carries more energy than the rest get a lower temperature and the others a higher
+    one, around SEGA's base s ** 0.08 (s the grid's growth per side), never below 1; the spread follows
+    how peaked the 2D spectrum is. SEGA multiplies cos and sin by m, so both query and key; here rope
+    runs before the qk norm, which would cancel it, so the query alone takes m ** 2 after the norms.
+    Returns the (head_dim,) query scale in split-half order, or None at or below the trained area.
+    """
+    if area_scale <= 1.0:
+        return None
+    spatial = image_embeds.float().mean(dim=-1).reshape(height, width)
+    spatial = spatial - spatial.mean()
+
+    radial = torch.fft.fftshift(torch.fft.fft2(spatial)).abs().pow(2).flatten()
+    yy, xx = torch.meshgrid(torch.arange(height, device=spatial.device) - height / 2.0,
+                            torch.arange(width, device=spatial.device) - width / 2.0, indexing="ij")
+    radius = (yy ** 2 + xx ** 2).sqrt().flatten()
+    n_bins = max(height, width) // 2
+    bins = (radius / (radius.max() + 1e-8) * n_bins).long().clamp(max=n_bins - 1)
+    energy = _binned(radial, bins, n_bins).clamp(min=1e-8)
+    flatness = float((energy.log().mean().exp() / (energy.mean() + 1e-8)).clamp(0.0, 1.0))
+    spread = 1.0 - flatness ** 1.5
+
+    pairs = head_dim // 2
+    m = torch.empty(pairs, device=spatial.device)
+    for axis, length in ((0, height), (1, width)):         # y on the even pairs, x on the odd ones
+        log_energy = _axis_energy(spatial, axis, max(length // 2, 8)).clamp(min=1e-8).log()
+        count = len(range(axis, pairs, 2))
+        position = torch.linspace(len(log_energy) - 1, 0.0, count, device=spatial.device)
+        low = position.floor().long()
+        high = (low + 1).clamp(max=len(log_energy) - 1)
+        raw = torch.lerp(log_energy[low], log_energy[high], position - low)
+        z = (raw - raw.mean()) / raw.std().clamp(min=1e-8)
+        shift = torch.tanh(1.5 * z)
+        m[axis::2] = (math.sqrt(area_scale) ** 0.08 * (1.0 - 0.15 * spread * (shift - shift.mean()))).clamp(min=1.0)
+    return (m ** 2).repeat(2).to(image_embeds.dtype)
+
+
+def tile_starts(length, tile, stride):
+    """Starts of equal tiles covering `length`, spread evenly, at most `stride` apart."""
+    if length <= tile:
+        return [0]
+    count = math.ceil((length - tile) / stride) + 1
+    return [round(i * (length - tile) / (count - 1)) for i in range(count)]
+
+
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+
+
+def hap_mask_mod(radii, seq_len, full_slices, block, width):
+    """The model's mask (causal, bidirectional inside each image block) minus, inside the generated block, the
+    pairs farther apart than the head's radius (-1: none dropped)."""
+    radii = torch.where(radii < 0, seq_len, radii)
+    start, end = block.start, block.stop
+
+    def mask_mod(b, h, q, kv):
+        keep = kv <= q
+        for full in full_slices:
+            keep = keep | ((q >= full.start) & (q < full.stop) & (kv >= full.start) & (kv < full.stop))
+        both = (q >= start) & (q < end) & (kv >= start) & (kv < end)
+        near = torch.maximum(((q - start) // width - (kv - start) // width).abs(),
+                             ((q - start) % width - (kv - start) % width).abs()) <= radii[h]
+        return keep & (~both | near)
+
+    return mask_mod
+
+
+class HapPlan:
+    """HAP (HRDiT, arXiv 2608.07003): each head attends, from the generated block, only to the block's tokens within
+    a spatial radius, plus everything ahead of the block.
+
+    HRDiT calibrates the radii offline per model. Here they are measured on the first step of a run, per layer
+    and head, from the attention of a sample of block queries: the smallest of 4, 8, 16 or 32 tokens that keeps
+    `mass` of their attention on average, or dense when none does. Later steps run a FlexAttention block mask.
+    """
+
+    def __init__(self, mass):
+        self.mass = mass
+        self.layout = None
+        self.radii, self.masks = {}, {}
+
+    def begin(self, layout):
+        """`layout` = (seq_len, full-attention slices, generated block slice, block width); a new one recalibrates."""
+        if layout != self.layout:
+            self.layout, self.radii, self.masks = layout, {}, {}
+
+    def attend(self, index, query, key, value, heads, dense):
+        seq_len, full_slices, block, width = self.layout
+        if index not in self.radii:
+            self.radii[index] = self._calibrate(query, key, block, width)
+            return dense()
+        if index not in self.masks:
+            self.masks[index] = self._mask(self.radii[index], seq_len, full_slices, block, width, heads, query.device)
+        return _compiled_flex_attention(query, key, value, block_mask=self.masks[index])
+
+    def _calibrate(self, query, key, block, width):
+        start, end = block.start, block.stop
+        sample = torch.linspace(start, end - 1, 128, device=query.device).long()
+        scores = query[:, :, sample].float() @ key[:, :, :end].float().transpose(-1, -2) / math.sqrt(query.shape[-1])
+        probs = torch.softmax(scores, dim=-1)
+        q_cell, k_cell = sample - start, torch.arange(end - start, device=query.device)
+        distance = torch.maximum((q_cell[:, None] // width - k_cell[None] // width).abs(),
+                                 (q_cell[:, None] % width - k_cell[None] % width).abs())
+        ahead = probs[..., :start].sum(-1)
+        radii = torch.full((query.shape[1],), -1, dtype=torch.long, device=query.device)
+        for radius in (4, 8, 16, 32):
+            kept = (ahead + (probs[..., start:] * (distance <= radius)).sum(-1)).mean(dim=(0, 2))
+            radii[(radii < 0) & (kept >= self.mass)] = radius
+        logging.info("[HAP] radii %s", radii.tolist())
+        return radii
+
+    @staticmethod
+    def _mask(radii, seq_len, full_slices, block, width, heads, device):
+        # compiled, so the mask is built block by block rather than as a heads x seq x seq tensor
+        return create_block_mask(hap_mask_mod(radii, seq_len, full_slices, block, width), None, heads, seq_len, seq_len,
+                                 device=device, _compile=True)
 
 
 def _bank_linear(experts, input, i):
@@ -488,7 +668,7 @@ class HunyuanImage3Attention(nn.Module):
         self.query_layernorm = operations.RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype, device=device)
         self.key_layernorm = operations.RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype, device=device)
 
-    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None):
+    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None, qk_scale=None, hap=None):
         bsz, q_len, _ = hidden_states.shape
 
         query, key, value = _split_qkv(self.qkv_proj(hidden_states), self.num_key_value_heads, self.num_key_value_groups, self.head_dim)
@@ -496,10 +676,20 @@ class HunyuanImage3Attention(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
+        if isinstance(freqs, list):
+            # SPA's bundle variants (`build_spa_rope_freqs`): the outputs are averaged, not the rotations
+            out = sum(self._attend(query, key, value, table, attention_mask, None, qk_scale) for table in freqs) / len(freqs)
+        else:
+            out = self._attend(query, key, value, freqs, attention_mask, kv_cache, qk_scale, hap)
+        return self.o_proj(out.transpose(1, 2).reshape(bsz, q_len, -1))
+
+    def _attend(self, query, key, value, freqs, attention_mask, kv_cache, qk_scale, hap=None):
         # rope goes in before the qk norm here, unlike the other models in this repo
         query, key = comfy.quant_ops.ck.apply_rope_split_half(query, key, freqs)
         query = self.query_layernorm(query)
         key = self.key_layernorm(key)
+        if qk_scale is not None:
+            query = query * qk_scale
 
         # Autoregressive decode: append this step's keys and values to the cache the caller owns, before
         # the GQA expansion. What gets stored is what the norms produced, one head-set per key/value
@@ -516,8 +706,11 @@ class HunyuanImage3Attention(nn.Module):
                 kv_cache[0], kv_cache[1] = key, value
 
         key, value = comfy.ops.repeat_kv_for_gqa(key, value, self.num_heads, -3)
-        out = optimized_attention_masked(query, key, value, self.num_heads, attention_mask, skip_reshape=True, skip_output_reshape=True)
-        return self.o_proj(out.transpose(1, 2).reshape(bsz, q_len, -1))
+        if hap is None:
+            return optimized_attention_masked(query, key, value, self.num_heads, attention_mask, skip_reshape=True, skip_output_reshape=True)
+        plan, index = hap
+        return plan.attend(index, query, key, value, self.num_heads, lambda: optimized_attention_masked(
+            query, key, value, self.num_heads, attention_mask, skip_reshape=True, skip_output_reshape=True))
 
 
 class HunyuanImage3MLP(nn.Module):
@@ -637,9 +830,9 @@ class HunyuanImage3DecoderLayer(nn.Module):
         self.post_attention_layernorm = operations.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, device=device)
         self.mlp = HunyuanImage3MoE(config, dtype=dtype, device=device, operations=operations)
 
-    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None):
+    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None, qk_scale=None, hap=None):
         residual = hidden_states
-        hidden_states = self.self_attn(self.input_layernorm(hidden_states), freqs, attention_mask, kv_cache)
+        hidden_states = self.self_attn(self.input_layernorm(hidden_states), freqs, attention_mask, kv_cache, qk_scale, hap)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
@@ -652,7 +845,8 @@ class HunyuanImage3Model(nn.Module):
         self.wte = operations.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id, dtype=dtype, device=device)
         self.layers = nn.ModuleList([HunyuanImage3DecoderLayer(config, dtype=dtype, device=device, operations=operations) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None, transformer_options=None):
+    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None, transformer_options=None, loop=None,
+                qk_scale=None, hap=None):
         """`kv_cache` is one `[keys, values]` pair per layer, owned by the caller.
 
         The diffusion path passes none and recomputes the whole sequence every step (that is its
@@ -669,15 +863,24 @@ class HunyuanImage3Model(nn.Module):
         # The CoT stage (it passes a kv cache) runs without: a lookahead over its non-bank modules was
         # measured at 861 vs 872 ms per token, i.e. nothing, and its whole-bank form is what
         # `expert_linear_sliced` exists to avoid.
+        # `loop` = (start, end, scale): layers [start, end) run a second time right after the first,
+        # the repeat adding `scale` of its update (Looped-DiT, arXiv 2609.40305, applied without training)
+        order, repeats = list(range(len(self.layers))), range(0)
+        if loop is not None:
+            start, end, scale = loop
+            order[end:end] = range(start, end)
+            repeats = range(end, 2 * end - start)
         lookahead = LayerLookahead(
-            self.layers, hidden_states.device,
+            self.layers, order, hidden_states.device,
             kv_cache is None and (transformer_options or {}).get("prefetch_dynamic_vbars", False))
         try:
-            for index, layer in enumerate(self.layers):
-                lookahead.before(index)
-                hidden_states = layer(hidden_states, freqs, attention_mask,
-                                      None if kv_cache is None else kv_cache[index])
-                lookahead.after(index)
+            for position, index in enumerate(order):
+                lookahead.before(position)
+                out = self.layers[index](hidden_states, freqs, attention_mask,
+                                         None if kv_cache is None else kv_cache[index], qk_scale,
+                                         None if hap is None else (hap, index))
+                hidden_states = torch.lerp(hidden_states, out, scale) if position in repeats and scale != 1.0 else out
+                lookahead.after(position)
         finally:
             lookahead.abort()
         return hidden_states
@@ -791,11 +994,28 @@ class HunyuanImage3(nn.Module):
             image_hidden = spectrum.predict(key, t, step_index)
         else:
             mask = build_attention_mask(step, seq_len, dtype, device)
+            sega = "hy3_sega" in transformer_options
             freqs = build_rope_freqs(seq_len, self.config.attention_head_dim, step["rope_image_info"],
-                                     self.config.rope_theta, device=device)
+                                     self.config.rope_theta, device=device,
+                                     dype_sigma=float(sigmas.flatten()[0]) if "hy3_dype" in transformer_options else None,
+                                     sega=sega)
             embeds = build_input_embeddings(self, step, latents.to(dtype), timestep, guidance, timestep_r,
                                             cond_latent=cond_latent, cond_vit=cond_vit)
-            hidden = self.model(embeds, freqs, mask, transformer_options=transformer_options)
+            if step_index < transformer_options.get("hy3_spa", 0):
+                freqs = build_spa_rope_freqs(seq_len, self.config.attention_head_dim, step["rope_image_info"],
+                                             self.config.rope_theta, device=device) or freqs
+            qk_scale = None
+            if sega:
+                qk_scale = sega_qk_scale(embeds[0, step["image_slice"]], step["token_height"], step["token_width"],
+                                         self.config.attention_head_dim, rope_area_scale(step["rope_image_info"]))
+            hap = transformer_options.get("hy3_hap")
+            if hap is not None:
+                if rope_area_scale(step["rope_image_info"]) > 1.0:
+                    hap.begin((seq_len, tuple(step["full_attention_slices"]), step["image_slice"], step["token_width"]))
+                else:
+                    hap = None
+            hidden = self.model(embeds, freqs, mask, transformer_options=transformer_options,
+                                loop=transformer_options.get("hy3_loop"), qk_scale=qk_scale, hap=hap)
             image_hidden = hidden[0, step["image_slice"]]
             if spectrum is not None:
                 if run_stack:

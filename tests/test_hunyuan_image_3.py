@@ -23,9 +23,12 @@ from comfy.ldm.hunyuan_image_3.model import (
     HunyuanImage3MoE,
     HunyuanImage3Params,
     HunyuanImage3MoEGate,
+    HunyuanImage3Model,
     _split_qkv,
     _swiglu,
     build_rope_freqs,
+    build_spa_rope_freqs,
+    sega_qk_scale,
 )
 
 
@@ -469,12 +472,13 @@ def test_expert_cast_paths_agree():
 
 
 def test_wide_image_grids_rescale_the_rope_base():
-    """A grid wider than 64x64 raises the rope base, as the reference's `base_rescale_factor` does.
+    """A grid larger than 64x64 raises the rope base by its growth in area, with the reference's
+    `base_rescale_factor` formula.
 
     Image positions grow with w*h — L+2016 at 64x64, L+4560 at 96x96 — and the reference never asks
-    for a grid beyond its resolution table, so an unscaled wider grid sits at rope phases the model
-    only ever encountered for text. Measured at 1536x1536: unscaled rendered a plausible image that
-    ignored the prompt, and the rescaled base rendered the prompt itself.
+    for a grid beyond its resolution table. Measured: unscaled, 2048x2048 renders noise; rescaled by
+    the side's growth, still noise at 2048x2048 and the prompt's text lost at 1536x1536; by the area's,
+    both render the prompt.
     """
     start, head_dim, slowest = 100, 128, 63
 
@@ -485,8 +489,8 @@ def test_wide_image_grids_rescale_the_rope_base():
         first = freqs[0, 0, start, slowest]
         return float(torch.atan2(first[1, 0], first[0, 0]))
 
-    raised = 10000.0 * (96 / 64) ** (head_dim / (head_dim - 2))
-    assert raised == pytest.approx(15096.9, rel=1e-5)
+    raised = 10000.0 * (96 * 96 / 64 ** 2) ** (head_dim / (head_dim - 2))
+    assert raised == pytest.approx(22791.5, rel=1e-5)
     assert block_angle(64, 64) == pytest.approx(2116.0 * 10000.0 ** (-2 * slowest / head_dim), abs=1e-5)
     assert block_angle(96, 96) == pytest.approx(4660.0 * raised ** (-2 * slowest / head_dim), abs=1e-4)
     assert block_angle(96, 96) < 4660.0 * 10000.0 ** (-2 * slowest / head_dim)
@@ -545,3 +549,140 @@ def _populated_quantized_model():
         state_dict.setdefault(key, torch.randn(value.shape).to(value.dtype) if value.is_floating_point() else value)
     model.load_state_dict(state_dict, strict=False)
     return params, model
+
+
+class _AddLayer(torch.nn.Module):
+    def __init__(self, index, calls):
+        super().__init__()
+        self.index, self.calls = index, calls
+
+    def forward(self, hidden_states, freqs, attention_mask=None, kv_cache=None, qk_scale=None, hap=None):
+        self.calls.append(self.index)
+        return hidden_states + 1
+
+
+@pytest.mark.parametrize("loop, order, total", [
+    (None, [0, 1, 2, 3], 4.0),
+    ((1, 3, 1.0), [0, 1, 2, 1, 2, 3], 6.0),
+    ((1, 3, 0.5), [0, 1, 2, 1, 2, 3], 5.0),     # each repeat adds half its update
+])
+def test_a_loop_repeats_its_span_right_after_the_first_pass(loop, order, total):
+    calls = []
+    stack = HunyuanImage3Model.__new__(HunyuanImage3Model)
+    torch.nn.Module.__init__(stack)
+    stack.layers = torch.nn.ModuleList(_AddLayer(i, calls) for i in range(4))
+    out = stack(torch.zeros(1, 2, 4), None, loop=loop)
+    assert calls == order
+    assert torch.all(out == total)
+
+
+def _theta(freqs):
+    """The per-pair frequencies back out of a rope table: the angle at text position 1."""
+    return torch.atan2(freqs[0, 0, 1, :, 1, 0], freqs[0, 0, 1, :, 0, 0])
+
+
+def test_dype_leaves_trained_sizes_alone():
+    section = (slice(4, 4 + 64 * 48), (64, 48))
+    plain = build_rope_freqs(4 + 64 * 48 + 2, 128, [section], 10000.0)
+    assert torch.equal(build_rope_freqs(4 + 64 * 48 + 2, 128, [section], 10000.0, dype_sigma=0.9), plain)
+
+
+def test_dype_starts_at_the_default_rescale_and_relaxes_to_the_trained_base():
+    section = (slice(4, 4 + 128 * 128), (128, 128))
+    static = build_rope_freqs(4 + 128 * 128, 128, [section], 10000.0)
+    assert torch.equal(build_rope_freqs(4 + 128 * 128, 128, [section], 10000.0, dype_sigma=1.0), static)
+    trained = _theta(build_rope_freqs(4 + 128 * 128, 128, [(slice(4, 4 + 64 * 64), (64, 64))], 10000.0))
+    late = _theta(build_rope_freqs(4 + 128 * 128, 128, [section], 10000.0, dype_sigma=0.01))
+    assert torch.allclose(late, trained, rtol=1e-3)
+
+
+def test_sega_rescales_a_little_less_and_leaves_trained_sizes_alone():
+    section = (slice(4, 4 + 128 * 128), (128, 128))
+    base = 10000.0 * 4.0 ** (128 / 126) / (1 + 0.1 * math.log(2.0))
+    theta = _theta(build_rope_freqs(4 + 128 * 128, 128, [section], 10000.0, sega=True))
+    assert torch.allclose(theta, 1.0 / base ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128), rtol=1e-5)
+    assert sega_qk_scale(torch.randn(64 * 64, 32), 64, 64, 128, 1.0) is None
+
+
+def test_sega_cools_the_pairs_whose_band_holds_the_energy():
+    # rows alternating +1/-1: the y axis's energy sits in its highest band, the x axis has none
+    rows = torch.arange(32).float()
+    image = torch.cos(math.pi * rows)[:, None, None].expand(32, 32, 8).reshape(32 * 32, 8)
+    scale = sega_qk_scale(image, 32, 32, 128, 4.0)
+    m = scale[:64].sqrt()
+    assert scale.shape == (128,) and torch.equal(scale[:64], scale[64:])
+    assert torch.all(m >= 1.0)
+    y = m[0::2]
+    assert y[0] < y[-1]          # the fastest y pair sits on the energetic band and gets the lower temperature
+
+
+def _positions(freqs):
+    """y/x positions back out of a rope table: pair 0 (y) and pair 1 (x) run at frequency 1."""
+    table = freqs[0, 0]
+    return torch.atan2(table[:, 0, 1, 0], table[:, 0, 0, 0]), torch.atan2(table[:, 1, 1, 0], table[:, 1, 0, 0])
+
+
+def test_spa_bundles_a_large_block_back_into_the_trained_grid():
+    start, side = 4, 128
+    seq_len = start + side * side + 3
+    info = [(slice(start, start + side * side), (side, side))]
+    tables = build_spa_rope_freqs(seq_len, 128, info, 10000.0)
+    assert len(tables) == 3                                  # bundles of 2: full, row slide, column slide
+    # full bundles lay the block out as the trained 64x64 grid: rows 0..63 from L + (64 * 64 - 64) / 2
+    plain = build_rope_freqs(start + 64 * 64 + 3, 128, [(slice(start, start + 64 * 64), (64, 64))], 10000.0)
+    y, x = (torch.round(torch.atan2(torch.sin(v), torch.cos(v)) * 1000) for v in _positions(tables[0]))
+    py, px = (torch.round(torch.atan2(torch.sin(v), torch.cos(v)) * 1000) for v in _positions(plain))
+    image = torch.arange(start, start + side * side)
+    assert torch.equal(torch.unique(y[image]), torch.unique(py[start:start + 64 * 64]))
+    assert torch.equal(y[-3:], py[-3:]) and torch.equal(x[-3:], px[-3:])   # the tail follows the 64x64 grid
+    assert build_spa_rope_freqs(4 + 64 * 64, 128, [(slice(4, 4 + 64 * 64), (64, 64))], 10000.0) is None
+
+
+def test_spa_averages_attention_outputs():
+    torch.manual_seed(0)
+    config = make_params()
+    module = HunyuanImage3Attention(config, dtype=torch.float32, operations=ops_for(torch.float32))
+    init_op_modules(module, torch.float32)
+    hidden_states = torch.randn(1, 10, config.hidden_size)
+    first = build_rope_freqs(10, config.attention_head_dim, [], config.rope_theta)
+    second = build_rope_freqs(10, config.attention_head_dim, [], 3.0 * config.rope_theta)
+    averaged = module(hidden_states, [first, second])
+    assert torch.allclose(averaged, (module(hidden_states, first) + module(hidden_states, second)) / 2, atol=1e-6)
+
+
+def test_tiled_denoise_blends_tiles_back_to_the_canvas():
+    from hunyuan_image_3.hires import TiledDenoise
+    from hunyuan_image_3.model import tile_starts
+
+    assert tile_starts(128, 64, 48) == [0, 32, 64]
+    calls = []
+
+    def apply_model(x, timestep, **c):
+        calls.append(tuple(x.shape[-2:]))
+        return x * 2
+
+    x = torch.randn(1, 4, 1, 100, 140)
+    out = TiledDenoise(64, 64, 16)(apply_model, {"input": x, "timestep": torch.ones(1), "c": {}})
+    assert set(calls) == {(64, 64)} and len(calls) == 2 * 3
+    assert torch.allclose(out, x * 2, atol=1e-5)          # a per-position model is reproduced exactly
+    small = torch.randn(1, 4, 1, 64, 64)
+    assert torch.equal(TiledDenoise(64, 64, 16)(apply_model, {"input": small, "timestep": torch.ones(1), "c": {}}), small * 2)
+
+
+def test_hap_mask_is_the_model_mask_minus_distant_block_pairs():
+    from torch.nn.attention.flex_attention import create_mask
+
+    from hunyuan_image_3.model import hap_mask_mod
+    from hunyuan_image_3.pipeline import build_attention_mask
+
+    prefix, height, width, suffix = 5, 4, 6, 3
+    seq = prefix + height * width + suffix
+    block = slice(prefix, prefix + height * width)
+    model_mask = build_attention_mask({"full_attention_slices": [block]}, seq, torch.float32, "cpu")[0, 0] == 0
+    unlimited = create_mask(hap_mask_mod(torch.tensor([-1, 1]), seq, (block,), block, width), 1, 2, seq, seq, "cpu")[0]
+    assert torch.equal(unlimited[0], model_mask)
+    cells = torch.arange(height * width)
+    distance = torch.maximum((cells[:, None] // width - cells[None] // width).abs(), (cells[:, None] % width - cells[None] % width).abs())
+    expected = model_mask.clone()
+    expected[block, block] = distance <= 1
+    assert torch.equal(unlimited[1], expected)

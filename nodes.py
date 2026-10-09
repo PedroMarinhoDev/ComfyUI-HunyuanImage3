@@ -32,15 +32,17 @@ from comfy_api.latest import ComfyExtension, IO
 
 from .hunyuan_image_3.vae import HunyuanImage3VAE
 
+from .hunyuan_image_3.hires import TiledDenoise
 from .hunyuan_image_3.loader import load_hunyuan_image_3
+from .hunyuan_image_3.model import HapPlan
 from .hunyuan_image_3.pipeline import DEFAULT_GUIDANCE_SCALE
 from .hunyuan_image_3.rewrite import (AUTO, REWRITE_ONLY, THINK_AND_REWRITE, RewriteSettings,
                                       head_candidates, run_rewrite)
 from .hunyuan_image_3.spectrum import SpectrumState
 from .hunyuan_image_3.system_prompt import SYSTEM_PROMPTS
 from .latent_formats import HunyuanImage3
-from .hunyuan_image_3.tokenizer import (COND_PATCH_LIMIT, MAX_COND_IMAGES, ResolutionGroup, build_sequence,
-                                        preset_options)
+from .hunyuan_image_3.tokenizer import (COND_PATCH_LIMIT, MAX_COND_IMAGES, VAE_SPATIAL_FACTOR, ResolutionGroup,
+                                        build_sequence, preset_options)
 
 BASE_SIZE = 1024
 LATENT_FORMAT = HunyuanImage3()
@@ -319,14 +321,17 @@ def _encode(model, prompt, width, height, custom_system_prompt, rewriting, conds
             cot_text, rewritten = run_rewrite(model, rewriting, prompt, system_prompt, cond_images,
                                               cond_meta.get("cond_latent"), cond_meta.get("cond_vit"))
 
-    # Above the trained grid the rope base is rescaled by the grid's growth factor (see
-    # build_rope_freqs). Measured, one prompt and seed: 1536x1536 (2.25x) renders the prompt with
-    # it and drifts without it; 2048x2048 (4x) comes back to the right animal but not the prompt.
+    # Above the trained grid the rope base is rescaled by the grid's growth in area (see
+    # build_rope_freqs). Measured: clean up to 4x the table's area (2048x2048) with the SEGA node, noise
+    # past it (2304x2304 and up) whatever the rope or schedule.
     area = width * height
     table_ceiling = max(entry.height * entry.width for entry in ResolutionGroup(BASE_SIZE).data)
-    if area > table_ceiling:
-        logging.info("HunyuanImage3: %dx%d is %.2fx the size this checkpoint's resolution table covers; "
-                     "prompt adherence degrades well past the table", width, height, area / table_ceiling)
+    if area > 4 * table_ceiling:
+        logging.warning("HunyuanImage3: %dx%d is %.2fx the area this checkpoint was trained on; past 4x "
+                        "(2048x2048) it renders noise.", width, height, area / table_ceiling)
+    elif area > table_ceiling:
+        logging.info("HunyuanImage3: %dx%d is %.2fx the area this checkpoint was trained on; toward 2048x2048 "
+                     "the SEGA node keeps it free of stray specks.", width, height, area / table_ceiling)
 
     def conditioning(uncond):
         sequence = build_sequence(tokenizer, prompt, f"{width}x{height}", system_prompt, cot_text=cot_text,
@@ -725,12 +730,169 @@ class HunyuanImage3Spectrum(IO.ComfyNode):
         return IO.NodeOutput(model)
 
 
+LOOP_PRESETS = {    # (start layer, end layer exclusive, update scale of the repeat)
+    "early x2": (4, 10, 1.0),
+    "mid x2": (11, 21, 1.0),
+    "mid x2 half": (11, 21, 0.5),
+}
+
+
+class HunyuanImage3Looping(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="HunyuanImage3Looping",
+            display_name="HunyuanImage-3.0 Looped Diffusion",
+            category="model/patch/hunyuan image 3",
+            description="Runs a span of transformer layers twice per sampling step (training-free Looped-DiT). "
+                        "early x2 (layers 4-9) helps dense text and prompt adherence; the mid presets "
+                        "(layers 11-20) can help counting but may drop subjects. About +15-27% time per step.",
+            inputs=[
+                IO.Model.Input("model"),
+                IO.Combo.Input("preset", options=list(LOOP_PRESETS), default="early x2"),
+            ],
+            outputs=[IO.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, preset) -> IO.NodeOutput:
+        model = model.clone()
+        model.model_options.setdefault("transformer_options", {})["hy3_loop"] = LOOP_PRESETS[preset]
+        return IO.NodeOutput(model)
+
+
+class HunyuanImage3DyPE(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="HunyuanImage3DyPE",
+            display_name="HunyuanImage-3.0 DyPE",
+            category="model/patch/hunyuan image 3",
+            description="Dynamic position extrapolation (DyPE) for images larger than 1024x1024: the rope rescale "
+                        "starts at the default and relaxes toward the trained positions as the steps go. Same "
+                        "composition as without it, with a different late-step detail; text tends to come out "
+                        "better without it. No effect at or below 1024x1024.",
+            inputs=[
+                IO.Model.Input("model"),
+                IO.Combo.Input("preset", options=["ntk"], default="ntk"),
+            ],
+            outputs=[IO.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, preset) -> IO.NodeOutput:
+        model = model.clone()
+        model.model_options.setdefault("transformer_options", {})["hy3_dype"] = preset
+        return IO.NodeOutput(model)
+
+
+class HunyuanImage3SEGA(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="HunyuanImage3SEGA",
+            display_name="HunyuanImage-3.0 SEGA",
+            category="model/patch/hunyuan image 3",
+            description="Spectral-energy guided attention (SEGA) for images larger than 1024x1024: a slightly "
+                        "weaker rope rescale plus a per-frequency attention temperature taken from the image's "
+                        "spatial spectrum at each step. No effect at or below 1024x1024.",
+            inputs=[IO.Model.Input("model")],
+            outputs=[IO.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> IO.NodeOutput:
+        model = model.clone()
+        model.model_options.setdefault("transformer_options", {})["hy3_sega"] = True
+        return IO.NodeOutput(model)
+
+
+class HunyuanImage3SPA(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="HunyuanImage3SPA",
+            display_name="HunyuanImage-3.0 SPA",
+            category="model/patch/hunyuan image 3",
+            description="Spatial position alignment (SPA, from HRDiT) for images larger than 1024x1024: on the "
+                        "first steps the image positions are grouped back into the trained grid, with the "
+                        "attention averaged over shifted groupings. Keeps the composition closer to a 1024 "
+                        "render (larger subjects, fewer repeats) at about +30% time at 2048x2048, but brings "
+                        "some stray specks back. No effect at or below 1024x1024.",
+            inputs=[
+                IO.Model.Input("model"),
+                IO.Int.Input("steps", default=3, min=1, max=100, tooltip="How many of the first steps use SPA."),
+            ],
+            outputs=[IO.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, steps) -> IO.NodeOutput:
+        model = model.clone()
+        model.model_options.setdefault("transformer_options", {})["hy3_spa"] = steps
+        return IO.NodeOutput(model)
+
+
+class HunyuanImage3TiledRefine(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="HunyuanImage3TiledRefine",
+            display_name="HunyuanImage-3.0 Tiled Refine",
+            category="model/patch/hunyuan image 3",
+            description="For a refinement pass on an upscaled image larger than the model handles in one go: every "
+                        "step runs the model on overlapping tiles and blends them. Encode the prompt at the tile "
+                        "size, and sample the upscaled latent with denoise below 1.",
+            inputs=[
+                IO.Model.Input("model"),
+                IO.Int.Input("tile_width", default=1024, min=256, max=2048, step=16),
+                IO.Int.Input("tile_height", default=1024, min=256, max=2048, step=16),
+                IO.Int.Input("overlap", default=256, min=0, max=1024, step=16),
+            ],
+            outputs=[IO.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, tile_width, tile_height, overlap) -> IO.NodeOutput:
+        model = model.clone()
+        model.set_model_unet_function_wrapper(TiledDenoise(tile_height // VAE_SPATIAL_FACTOR, tile_width // VAE_SPATIAL_FACTOR,
+                                                           overlap // VAE_SPATIAL_FACTOR))
+        return IO.NodeOutput(model)
+
+
+class HunyuanImage3HAP(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="HunyuanImage3HAP",
+            display_name="HunyuanImage-3.0 HAP",
+            category="model/patch/hunyuan image 3",
+            description="Head-adaptive attention pruning (HAP, from HRDiT) for images larger than 1024x1024: after the "
+                        "first step each head attends only to nearby image tokens, within a radius measured on that "
+                        "step. A speed-up for the attention; no effect at or below 1024x1024.",
+            inputs=[
+                IO.Model.Input("model"),
+                IO.Float.Input("mass", default=0.95, min=0.5, max=1.0, step=0.01,
+                               tooltip="Share of each head's attention the radius must keep."),
+            ],
+            outputs=[IO.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, mass) -> IO.NodeOutput:
+        model = model.clone()
+        model.model_options.setdefault("transformer_options", {})["hy3_hap"] = HapPlan(mass)
+        return IO.NodeOutput(model)
+
+
 class HunyuanImage3Extension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
         return [HunyuanImage3ModelLoader, HunyuanImage3Resolutions, HunyuanImage3TextEncode,
                 HunyuanImage3ImageEncode, HunyuanImage3PromptRewriting, HunyuanImage3Guidance,
-                HunyuanImage3EmptyLatent, HunyuanImage3VAELoader, HunyuanImage3Spectrum]
+                HunyuanImage3EmptyLatent, HunyuanImage3VAELoader, HunyuanImage3Spectrum,
+                HunyuanImage3Looping, HunyuanImage3DyPE, HunyuanImage3SEGA,
+                HunyuanImage3SPA, HunyuanImage3TiledRefine, HunyuanImage3HAP]
 
 
 async def comfy_entrypoint() -> HunyuanImage3Extension:

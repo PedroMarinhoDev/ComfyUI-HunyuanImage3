@@ -66,8 +66,9 @@ def _offload_stream(stream):
 
 
 class LayerLookahead:
-    def __init__(self, layers, device, enabled, depth=None):
+    def __init__(self, layers, order, device, enabled, depth=None):
         self.layers = layers
+        self.order = order                # layer indices in run order; a loop repeats some
         self.device = device
         self.depth = DEPTH if depth is None else depth
         self.pending = {}                 # layer index -> (stream, modules)
@@ -78,14 +79,15 @@ class LayerLookahead:
             and comfy.model_management.device_supports_non_blocking(device))
         self.streams = _pool(device, self.depth + 1) if self.enabled else []
 
-    def _issue(self, index):
-        if index >= len(self.layers) or index in self.pending:
+    def _issue(self, index, position):
+        if index in self.pending:
             return
         modules = [m for m in self.layers[index].modules() if hasattr(m, "_v")]
         if not modules:
             self.pending[index] = (None, [])
             return
-        stream = self.streams[index % len(self.streams)]
+        # by run position, not layer index: a loop jumping back must not share the computing layer's stream
+        stream = self.streams[position % len(self.streams)]
         # nothing in this stream's buffer is overwritten before the compute that read it has run
         stream.wait_stream(comfy.model_management.current_stream(self.device))
         with _offload_stream(stream):
@@ -96,18 +98,19 @@ class LayerLookahead:
             comfy.model_management.ensure_pin_registerable(size)
         self.pending[index] = (stream, modules)
 
-    def before(self, index):
+    def before(self, position):
         if not self.enabled:
             return
-        for ahead in range(self.depth + 1):
-            self._issue(index + ahead)     # index itself is already in flight, except for layer 0
-        stream, _ = self.pending[index]
+        for ahead in range(self.depth + 1):    # the current layer is already in flight, except the first
+            if position + ahead < len(self.order):
+                self._issue(self.order[position + ahead], position + ahead)
+        stream, _ = self.pending[self.order[position]]
         comfy.model_management.sync_stream(self.device, stream)
 
-    def after(self, index):
+    def after(self, position):
         if not self.enabled:
             return
-        self._release(index)
+        self._release(self.order[position])
 
     def _release(self, index):
         stream, modules = self.pending.pop(index)

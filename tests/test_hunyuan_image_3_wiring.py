@@ -257,11 +257,11 @@ def test_off_table_size_keeps_its_own_grid_and_snaps_only_the_ratio_token():
 
 
 @needs_model_dir
-def test_a_sequence_past_the_position_limit_is_rejected_with_both_numbers():
-    """The guard names the request and the limit rather than truncating it silently.
-
-    A 3072x2048 request is a 192x128 grid: 24576 image tokens plus ~1260 of prompt and meta against a
-    limit of 22800. Truncating instead would generate something other than what was asked for.
+def test_a_sequence_past_the_position_limit_warns_with_both_numbers(caplog):
+    """A 3072x2048 request is a 192x128 grid: 24576 image tokens plus ~1260 of prompt and meta, past the
+    checkpoint's 22800. The rope is built on the fly, so the sequence is built as asked, with a warning
+    naming the request and the limit; a render that size comes out as noise (measured from 2304x2304,
+    still inside the limit), which the encoder's own area warning says.
     """
     from tokenizers import Tokenizer
 
@@ -270,9 +270,8 @@ def test_a_sequence_past_the_position_limit_is_rejected_with_both_numbers():
     build_sequence = functools.partial(_build_sequence, cfg_distilled=True, use_meanflow=True)
 
     tokenizer = Tokenizer.from_file(os.path.join(_model_dir(), "tokenizer.json"))
-    with pytest.raises(ValueError) as error:
-        build_sequence(tokenizer, "a red fox asleep in tall grass", "3072x2048",
-                       UNIFIED_SYSTEM_PROMPT_EN, base_size=1024, max_position_embeddings=22800)
-    message = str(error.value)
-    assert "3072x2048" in message and "22800" in message and "24576" in message
+    sequence = build_sequence(tokenizer, "a red fox asleep in tall grass", "3072x2048",
+                              UNIFIED_SYSTEM_PROMPT_EN, base_size=1024, max_position_embeddings=22800)
+    assert len(sequence["ids"]) > 22800
+    assert "3072x2048" in caplog.text and "22800" in caplog.text
 

@@ -22,6 +22,7 @@ at 1024x1024, `step6a_port_vs_reference.py`):
 
 There is no trailing eos: the reference's t2i path passes `add_eos=False`.
 """
+import logging
 import re
 
 import torch
@@ -434,13 +435,9 @@ def build_sequence(tokenizer, prompt, image_size, system_prompt, cot_text=None, 
     positions = writer.image_meta(geometry, with_guidance=cfg_distilled, with_timestep_r=use_meanflow)
     image_start = len(writer.tokens)
     if image_start + geometry.image_token_length > max_position_embeddings:
-        raise ValueError(
-            f"{geometry.width}x{geometry.height} needs {image_start + geometry.image_token_length} "
-            f"positions ({image_start} of prompt, conditioning and meta tokens plus "
-            f"{geometry.image_token_length} of image) but this checkpoint handles "
-            f"{max_position_embeddings}. Reduce the resolution, shorten the prompt, or use fewer "
-            f"conditioning images."
-        )
+        logging.warning("HunyuanImage3: %dx%d needs %d positions, past the %d this checkpoint was trained with.",
+                        geometry.width, geometry.height, image_start + geometry.image_token_length,
+                        max_position_embeddings)
     writer.tokens += [ids["img"]] * geometry.image_token_length
     image_end = len(writer.tokens)
     writer.tokens.append(ids["eoi"])

@@ -129,8 +129,11 @@ The text "head" that prompt rewriting uses lives in its own `cot_head` file, so 
    themselves (the model's own "empty" prompt), so there's no second text box to fill.
 
 **Image size.** The model was trained at about 1 megapixel, in 37 shapes from 2048×512 to 512×2048
-(pick one in **HunyuanImage 3.0 Resolutions**). Custom sizes up to about 1536×1536 work. Much larger, like
-2048×2048, is beyond what the model can do and comes out garbled; for big images, generate at 1024 and upscale.
+(pick one in **HunyuanImage 3.0 Resolutions**). Custom sizes work up to 4× that area, 2048×2048: the RoPE base
+is rescaled by how much larger the image is than 1024×1024. Larger images widen the scene rather than
+enlarging it, and past 4× (2304×2304 and up) the output is noise. For big images, generate at a native size and
+upscale. The experimental nodes in [Large images and looped diffusion](#experimental-large-images-and-looped-diffusion)
+help with both routes.
 
 ## Speed
 
@@ -276,6 +279,40 @@ the full render (the SSIM column: 1 would be identical). On the 8-step Instruct-
 so it saves only a few seconds, and the image stays very close. The defaults follow the paper; `flex_window`
 trades speed for fidelity.
 
+## Experimental: large images and looped diffusion
+
+> **These nodes are experimental and still under development.** Their inputs, defaults and behaviour may change
+> between updates, the workflows don't use them yet, and some combinations break the image (see below).
+
+Each one goes between the model loader and the KSampler, like Spectrum, and they can be chained.
+
+| Node | What it does | Cost |
+|---|---|---|
+| **HunyuanImage-3.0 SEGA** | above 1024×1024: a slightly weaker RoPE rescale plus a per-frequency attention temperature taken from the image's own spectrum | no extra time |
+| **HunyuanImage-3.0 SPA** | above 1024×1024: for the first `steps` (default 3) the positions are folded back into the trained grid, which keeps a 1024-style composition with larger subjects | about +30% |
+| **HunyuanImage-3.0 DyPE** | above 1024×1024: the RoPE rescale relaxes over the steps; text usually comes out better without it | no extra time |
+| **HunyuanImage-3.0 HAP** | above 1024×1024: after the first step each attention head only looks at nearby image tokens. A speed-up; the image barely changes | about 12% faster per step at 2× |
+| **HunyuanImage-3.0 Looped Diffusion** | runs a span of layers twice per step: `early x2` (layers 4–9) for sharper detail and denser text, `mid x2` and `mid x2 half` (layers 11–20) for counting, at the risk of dropping subjects | +15–27% per step |
+| **HunyuanImage-3.0 Tiled Refine** | for a refinement pass on an upscaled image too large for one go: every step runs on overlapping tiles and blends them | grows with the number of tiles |
+
+What two test sweeps found (Instruct-Distil, 8 steps, from a 768×1280 and an 896×1152 render, scaled by whole
+multiples):
+
+- **From scratch at 2× per side** (4× the area), whether a plain render holds up depends on the prompt and the
+  shape: in one test a chessboard floor multiplied into the sky. **SEGA**, **SPA** or **Looped Diffusion
+  `early x2`** each fixed it on its own. DyPE, HAP, Spectrum and a ModelSamplingSD3 shift of 6 did not, and the
+  `mid` loop presets made it worse.
+- **Pairs that fight:** SPA + Looped `early x2` scattered coloured specks over the image in every test, and so
+  did SEGA + SPA at 2× (at 1.5× per side it was the one combination that worked). Try one fixer at a time.
+- **Upscaling:** a stock hires pass (upscale the image, VAE encode, sample at denoise 0.3–0.5) is safe up to 2×;
+  at denoise 0.7 faces start to change, and at 3× a faint grid texture prints into flat areas. Past 2× use
+  **Tiled Refine**: tiles at a native size such as 896×1152, overlap 256, the prompt encoded at the tile size (a
+  short general description of the image works), denoise 0.3. It took a 2× image to 3072×5120 cleanly in about
+  11 minutes on the 4090.
+- **Keep Spectrum and Looped Diffusion off tiled passes:** Spectrum's prediction blends the tiles into a mottled
+  texture, and the loop speckles flat areas.
+- At native sizes, Looped `early x2` gave crisper edges and more small detail for about +20% time.
+
 ## Nodes
 
 | Node | What it does |
@@ -289,6 +326,9 @@ trades speed for fidelity.
 | **HunyuanImage 3.0 Empty Latent** | an empty latent of the right shape |
 | **Load HunyuanImage-3.0 VAE** | the model's VAE (the stock VAE loader misdetects it) |
 | **HunyuanImage-3.0 Spectrum** | optional speed-up, see above |
+| **HunyuanImage-3.0 SEGA**, **SPA**, **DyPE**, **HAP** | experimental, for images larger than 1024×1024, see [Experimental](#experimental-large-images-and-looped-diffusion) |
+| **HunyuanImage-3.0 Looped Diffusion** | experimental, extra detail for extra time, see [Experimental](#experimental-large-images-and-looped-diffusion) |
+| **HunyuanImage-3.0 Tiled Refine** | experimental, for refining images beyond 2×, see [Experimental](#experimental-large-images-and-looped-diffusion) |
 
 Both encoders use each model's built-in system prompt. To use your own, connect any text to their optional
 `custom_system_prompt` input.
@@ -335,8 +375,11 @@ and ~45 GB of free RAM. Existing outputs are skipped, so an interrupted run can 
   `max_new_tokens` to 512–768.
 - **"prompt rewriting needs the … text head"**: download that model's `cot_head` file into
   `models/diffusion_models`.
-- **An edit looks overbaked or oversaturated**: use a different seed than the one that made the input image.
-  Re-using it pushes the result too far.
+- **An edit looks overbaked or oversaturated, or comes out as colour noise**: use a different seed than the one
+  that made the input image. Re-using it pushes the result too far, and some seed and size combinations render
+  only noise (a known issue, under investigation).
+- **A ModelSamplingSD3 shift does nothing with Spectrum**: a shift set before the Spectrum node is currently
+  lost (a known issue).
 
 ## License
 

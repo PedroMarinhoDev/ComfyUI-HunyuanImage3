@@ -578,9 +578,20 @@ class HunyuanImage3MoE(nn.Module):
         top_k_weights, top_k_index = self.gate(flat)
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
-        # one pass per expert that any token was routed to
-        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        # Group the (slot, token) routing pairs by expert once per layer. The previous form
+        # ran `.item()` + `torch.where` per expert: two GPU->CPU waits for each of 64 experts
+        # x 32 layers, leaving the GPU ~35% busy behind one saturated CPU thread. One stable
+        # sort plus one counts read gives the same rows in the same order
+        # `torch.where(expert_mask[e])` gave (slot-major, then token), so results are unchanged.
+        num_tokens = flat.shape[0]
+        routing = top_k_index.t().reshape(-1)                     # position q = slot * num_tokens + token
+        order = torch.sort(routing, stable=True).indices
+        counts = torch.bincount(routing, minlength=self.num_experts).tolist()
+        token_sorted = order % num_tokens
+        slot_sorted = order // num_tokens
+        dest_sorted = token_sorted * self.top_k + slot_sorted
+        weight_sorted = top_k_weights[token_sorted, slot_sorted, None]
+        expert_hit = [e for e, c in enumerate(counts) if c]
 
         combined = torch.zeros((flat.shape[0] * self.top_k, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device)
         # A whole sequence routes to nearly every expert, so one cast of the bank serves all of them, and
@@ -600,12 +611,15 @@ class HunyuanImage3MoE(nn.Module):
         # the bank for every one of them (see `ops.expert_linear_sliced`)
         linear = _bank_linear if full_bank else expert_linear_sliced
         with gate_up_bank as gate_up_experts, down_bank as down_experts:
-            for expert in expert_hit:
-                expert_index = int(expert.item())
-                top_k_pos, token_index = torch.where(expert_mask[expert_index])
-                gate_up = linear(gate_up_experts, flat[token_index], expert_index)
+            start = 0
+            for expert_index, count in enumerate(counts):
+                if not count:
+                    continue
+                rows = slice(start, start + count)
+                start += count
+                gate_up = linear(gate_up_experts, flat[token_sorted[rows]], expert_index)
                 expert_out = linear(down_experts, _swiglu(gate_up), expert_index)
-                combined[token_index * self.top_k + top_k_pos] = (expert_out * top_k_weights[token_index, top_k_pos, None]).to(combined.dtype)
+                combined[dest_sorted[rows]] = (expert_out * weight_sorted[rows]).to(combined.dtype)
 
         # (N * top_k, hidden) then sum, not index_add_ into (N, hidden): measured 2.34e-03 vs 4.00e-03
         # relative error against fp64 for the same inputs, because the reduction accumulates internally

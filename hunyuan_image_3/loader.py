@@ -19,6 +19,7 @@ import comfy.latent_formats
 import comfy.model_management
 import comfy.model_patcher
 import comfy.ops
+import comfy.storage
 import comfy.utils
 from ..latent_formats import HunyuanImage3
 
@@ -177,7 +178,8 @@ def load_hunyuan_image_3(checkpoint_path, disable_dynamic=False):
     # plain ModelPatcher alias before that happens — silently, with no log line, on exactly the large
     # offloaded models this loader exists for
     patcher_class = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
-    patcher = patcher_class(model, load_device=load_device, offload_device=offload_device)
+    patcher = patcher_class(model, load_device=load_device, offload_device=offload_device,
+                            fast_disk=comfy.storage.state_dict_fast_disk(state_dict))
     patcher.cached_patcher_init = (_patcher_factory, (checkpoint_path,))
 
     # the converted file carries this port's key names already

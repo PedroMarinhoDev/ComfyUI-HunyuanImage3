@@ -1,0 +1,18 @@
+[project]
+name = "hunyuanimage3-native"
+description = "Run Tencent's HunyuanImage-3.0 (80B MoE) natively in ComfyUI on a 24 GB GPU: base, Instruct and Instruct-Distil, prompt rewriting, image editing, Spectrum speed-up."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = ["Operating System :: OS Independent", "Environment :: GPU :: NVIDIA CUDA"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/PedroMarinhoDev/ComfyUI-HunyuanImage3"
+Documentation = "https://github.com/PedroMarinhoDev/ComfyUI-HunyuanImage3#readme"
+"Bug Tracker" = "https://github.com/PedroMarinhoDev/ComfyUI-HunyuanImage3/issues"
+
+[tool.comfy]
+PublisherId = "pedromarinhodev"
+DisplayName = "HunyuanImage 3.0 (native)"
+Icon = "https://raw.githubusercontent.com/PedroMarinhoDev/ComfyUI-HunyuanImage3/main/assets/registry-icon.png"

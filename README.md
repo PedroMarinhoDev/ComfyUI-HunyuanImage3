@@ -37,6 +37,8 @@ speed matter more here than for most models, and why a smaller GPU costs surpris
 
 ## Install
 
+Search for **HunyuanImage 3.0 (native)** in ComfyUI-Manager, or install it from the [Comfy Registry](https://registry.comfy.org/nodes/hunyuanimage3-native) with `comfy node install hunyuanimage3-native`. Or clone it:
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/PedroMarinhoDev/ComfyUI-HunyuanImage3
